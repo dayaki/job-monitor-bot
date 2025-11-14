@@ -16,8 +16,8 @@ SEARCH_KEYWORDS = os.getenv('SEARCH_KEYWORDS', 'python developer,software engine
 SEARCH_KEYWORDS = [kw.strip() for kw in SEARCH_KEYWORDS]
 
 NOTIFICATION_METHOD = os.getenv('NOTIFICATION_METHOD', 'telegram')  # telegram or email
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '8083956471:AAGNkFh_x_YGVJTSTOHExJ4qrzUfSnapYUk')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '1010499402')
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 
 EMAIL_SENDER = os.getenv('EMAIL_SENDER', '')
 EMAIL_PASSWORD = os.getenv('EMAIL_PASSWORD', '')
