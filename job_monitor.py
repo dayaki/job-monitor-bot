@@ -1,5 +1,5 @@
 """
-Job Site Monitoring Bot - GitHub Actions Version with 15+ Job Sites
+Job Site Monitoring Bot - GitHub Actions Version with 20+ Job Sites
 Checks multiple job sites for new postings and sends notifications
 """
 
@@ -11,7 +11,7 @@ import os
 import re
 import time
 from datetime import datetime
-from urllib.parse import urljoin, urlparse, parse_qs
+from urllib.parse import urljoin, urlparse, parse_qs, quote
 
 # ============= CONFIGURATION FROM ENVIRONMENT =============
 SEARCH_KEYWORDS = os.getenv('SEARCH_KEYWORDS', 'python developer,software engineer,backend developer').split(',')
@@ -24,6 +24,10 @@ TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 EMAIL_SENDER = os.getenv('EMAIL_SENDER', '')
 EMAIL_PASSWORD = os.getenv('EMAIL_PASSWORD', '')
 EMAIL_RECIPIENT = os.getenv('EMAIL_RECIPIENT', '')
+
+# Adzuna API credentials (optional - get from https://developer.adzuna.com/)
+ADZUNA_APP_ID = os.getenv('ADZUNA_APP_ID', '')
+ADZUNA_APP_KEY = os.getenv('ADZUNA_APP_KEY', '')
 
 # ============= JOB SITE SCRAPERS =============
 
@@ -110,6 +114,44 @@ class JobSiteScraper:
             print(f"Error scraping RemoteOK: {e}")
         return jobs
     
+    def search_remoteok_devjobs(self, keywords):
+        """Scrape RemoteOK remote-dev-jobs section"""
+        jobs = []
+        try:
+            print("Searching RemoteOK Dev Jobs...")
+            response = requests.get("https://remoteok.com/remote-dev-jobs", headers=self.headers, timeout=15)
+            
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.content, 'html.parser')
+                job_rows = soup.find_all('tr', class_='job')
+                
+                for row in job_rows[:30]:
+                    try:
+                        title_elem = row.find('h2', itemprop='title')
+                        company_elem = row.find('h3', itemprop='name')
+                        link_elem = row.find('a', itemprop='url')
+                        
+                        if title_elem and link_elem:
+                            title = title_elem.get_text(strip=True)
+                            
+                            if self.matches_keywords(title, keywords):
+                                job_data = {
+                                    'title': title,
+                                    'company': company_elem.get_text(strip=True) if company_elem else 'N/A',
+                                    'location': 'Remote',
+                                    'url': f"https://remoteok.com{link_elem['href']}",
+                                    'posted': 'Recent',
+                                    'source': 'RemoteOK-Dev'
+                                }
+                                self.add_job_if_new(job_data, jobs)
+                    except:
+                        continue
+                
+                print(f"RemoteOK Dev: Found {len(jobs)} new jobs")
+        except Exception as e:
+            print(f"Error scraping RemoteOK Dev: {e}")
+        return jobs
+    
     def search_weworkremotely(self, keywords):
         """Scrape We Work Remotely"""
         jobs = []
@@ -180,91 +222,14 @@ class JobSiteScraper:
             print(f"Error scraping Remotive: {e}")
         return jobs
     
-    # ========== NEW SITES FROM YOUR LIST ==========
-    
-    def search_remoterocketship(self, keywords):
-        """Scrape Remote Rocketship"""
-        jobs = []
-        try:
-            print("Searching RemoteRocketship...")
-            # Note: This site may require a subscription, trying to scrape public listings
-            response = requests.get("https://www.remoterocketship.com/", 
-                                  headers=self.headers, timeout=15)
-            
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.content, 'html.parser')
-                job_cards = soup.find_all('a', href=re.compile(r'/jobs/'))
-                
-                for card in job_cards[:20]:
-                    try:
-                        title = card.get_text(strip=True)
-                        url = urljoin("https://www.remoterocketship.com", card['href'])
-                        
-                        if self.matches_keywords(title, keywords):
-                            job_data = {
-                                'title': title,
-                                'company': 'Various',
-                                'location': 'Remote',
-                                'url': url,
-                                'posted': 'Recent',
-                                'source': 'RemoteRocketship'
-                            }
-                            self.add_job_if_new(job_data, jobs)
-                    except:
-                        continue
-                
-                print(f"RemoteRocketship: Found {len(jobs)} new jobs")
-        except Exception as e:
-            print(f"Error scraping RemoteRocketship: {e}")
-        return jobs
-    
-    def search_workinstartups(self, keywords):
-        """Scrape Work in Startups"""
-        jobs = []
-        try:
-            print("Searching WorkInStartups...")
-            # Search for developer roles
-            response = requests.get("https://workinstartups.com/job-board/", 
-                                  headers=self.headers, timeout=15)
-            
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.content, 'html.parser')
-                job_listings = soup.find_all('div', class_=re.compile(r'job'))
-                
-                for job in job_listings[:20]:
-                    try:
-                        title_elem = job.find(['h3', 'h2', 'a'])
-                        if title_elem:
-                            title = title_elem.get_text(strip=True)
-                            
-                            if self.matches_keywords(title, keywords):
-                                link = job.find('a', href=True)
-                                url = urljoin("https://workinstartups.com", link['href']) if link else ''
-                                
-                                job_data = {
-                                    'title': title,
-                                    'company': 'Startup',
-                                    'location': 'Various',
-                                    'url': url,
-                                    'posted': 'Recent',
-                                    'source': 'WorkInStartups'
-                                }
-                                self.add_job_if_new(job_data, jobs)
-                    except:
-                        continue
-                
-                print(f"WorkInStartups: Found {len(jobs)} new jobs")
-        except Exception as e:
-            print(f"Error scraping WorkInStartups: {e}")
-        return jobs
+    # ========== WEB3/CRYPTO SITES ==========
     
     def search_bitcoinerjobs(self, keywords):
         """Scrape Bitcoiner Jobs"""
         jobs = []
         try:
             print("Searching BitcoinerJobs...")
-            response = requests.get("https://bitcoinerjobs.com/", 
-                                  headers=self.headers, timeout=15)
+            response = requests.get("https://bitcoinerjobs.com/", headers=self.headers, timeout=15)
             
             if response.status_code == 200:
                 soup = BeautifulSoup(response.content, 'html.parser')
@@ -292,52 +257,12 @@ class JobSiteScraper:
             print(f"Error scraping BitcoinerJobs: {e}")
         return jobs
     
-    def search_hiringcafe(self, keywords):
-        """Scrape Hiring Cafe"""
-        jobs = []
-        try:
-            print("Searching HiringCafe...")
-            response = requests.get("https://hiring.cafe/", 
-                                  headers=self.headers, timeout=15)
-            
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.content, 'html.parser')
-                job_items = soup.find_all(['div', 'article'], class_=re.compile(r'job', re.I))
-                
-                for item in job_items[:20]:
-                    try:
-                        title_elem = item.find(['h2', 'h3', 'a'])
-                        if title_elem:
-                            title = title_elem.get_text(strip=True)
-                            
-                            if self.matches_keywords(title, keywords):
-                                link = item.find('a', href=True)
-                                url = link['href'] if link else ''
-                                
-                                job_data = {
-                                    'title': title,
-                                    'company': 'Various',
-                                    'location': 'Remote',
-                                    'url': url if url.startswith('http') else urljoin("https://hiring.cafe", url),
-                                    'posted': 'Recent',
-                                    'source': 'HiringCafe'
-                                }
-                                self.add_job_if_new(job_data, jobs)
-                    except:
-                        continue
-                
-                print(f"HiringCafe: Found {len(jobs)} new jobs")
-        except Exception as e:
-            print(f"Error scraping HiringCafe: {e}")
-        return jobs
-    
     def search_web3career(self, keywords):
         """Scrape Web3 Career"""
         jobs = []
         try:
             print("Searching Web3Career...")
-            response = requests.get("https://web3.career/", 
-                                  headers=self.headers, timeout=15)
+            response = requests.get("https://web3.career/", headers=self.headers, timeout=15)
             
             if response.status_code == 200:
                 soup = BeautifulSoup(response.content, 'html.parser')
@@ -375,8 +300,7 @@ class JobSiteScraper:
         jobs = []
         try:
             print("Searching Remote3...")
-            response = requests.get("https://www.remote3.co/", 
-                                  headers=self.headers, timeout=15)
+            response = requests.get("https://www.remote3.co/", headers=self.headers, timeout=15)
             
             if response.status_code == 200:
                 soup = BeautifulSoup(response.content, 'html.parser')
@@ -412,8 +336,7 @@ class JobSiteScraper:
         jobs = []
         try:
             print("Searching Protocol AI...")
-            response = requests.get("https://jobs.protocol.ai/jobs", 
-                                  headers=self.headers, timeout=15)
+            response = requests.get("https://jobs.protocol.ai/jobs", headers=self.headers, timeout=15)
             
             if response.status_code == 200:
                 soup = BeautifulSoup(response.content, 'html.parser')
@@ -449,8 +372,7 @@ class JobSiteScraper:
         jobs = []
         try:
             print("Searching CryptocurrencyJobs...")
-            response = requests.get("https://cryptocurrencyjobs.co/", 
-                                  headers=self.headers, timeout=15)
+            response = requests.get("https://cryptocurrencyjobs.co/", headers=self.headers, timeout=15)
             
             if response.status_code == 200:
                 soup = BeautifulSoup(response.content, 'html.parser')
@@ -486,8 +408,7 @@ class JobSiteScraper:
         jobs = []
         try:
             print("Searching LaborX...")
-            response = requests.get("https://laborx.com/jobs", 
-                                  headers=self.headers, timeout=15)
+            response = requests.get("https://laborx.com/jobs", headers=self.headers, timeout=15)
             
             if response.status_code == 200:
                 soup = BeautifulSoup(response.content, 'html.parser')
@@ -518,13 +439,14 @@ class JobSiteScraper:
             print(f"Error scraping LaborX: {e}")
         return jobs
     
+    # ========== GENERAL REMOTE SITES ==========
+    
     def search_dailyremote(self, keywords):
         """Scrape Daily Remote"""
         jobs = []
         try:
             print("Searching DailyRemote...")
-            response = requests.get("https://dailyremote.com/", 
-                                  headers=self.headers, timeout=15)
+            response = requests.get("https://dailyremote.com/", headers=self.headers, timeout=15)
             
             if response.status_code == 200:
                 soup = BeautifulSoup(response.content, 'html.parser')
@@ -562,8 +484,7 @@ class JobSiteScraper:
         jobs = []
         try:
             print("Searching JustRemote...")
-            response = requests.get("https://justremote.co/remote-jobs", 
-                                  headers=self.headers, timeout=15)
+            response = requests.get("https://justremote.co/remote-jobs", headers=self.headers, timeout=15)
             
             if response.status_code == 200:
                 soup = BeautifulSoup(response.content, 'html.parser')
@@ -601,8 +522,7 @@ class JobSiteScraper:
         jobs = []
         try:
             print("Searching WorkingNomads...")
-            response = requests.get("https://www.workingnomads.com/jobs", 
-                                  headers=self.headers, timeout=15)
+            response = requests.get("https://www.workingnomads.com/jobs", headers=self.headers, timeout=15)
             
             if response.status_code == 200:
                 soup = BeautifulSoup(response.content, 'html.parser')
@@ -638,8 +558,7 @@ class JobSiteScraper:
         jobs = []
         try:
             print("Searching Remote.co...")
-            response = requests.get("https://remote.co/remote-jobs/", 
-                                  headers=self.headers, timeout=15)
+            response = requests.get("https://remote.co/remote-jobs/", headers=self.headers, timeout=15)
             
             if response.status_code == 200:
                 soup = BeautifulSoup(response.content, 'html.parser')
@@ -672,21 +591,305 @@ class JobSiteScraper:
             print(f"Error scraping Remote.co: {e}")
         return jobs
     
+    # ========== NEW SITES ==========
+    
+    def search_wellfound(self, keywords):
+        """Scrape Wellfound (formerly AngelList)"""
+        jobs = []
+        try:
+            print("Searching Wellfound...")
+            # Try startup jobs page
+            response = requests.get("https://wellfound.com/jobs", headers=self.headers, timeout=15)
+            
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.content, 'html.parser')
+                job_cards = soup.find_all(['div', 'article'], class_=re.compile(r'job|startup'))
+                
+                for card in job_cards[:30]:
+                    try:
+                        title_elem = card.find(['h2', 'h3', 'a'], class_=re.compile(r'title|job'))
+                        if title_elem:
+                            title = title_elem.get_text(strip=True)
+                            
+                            if self.matches_keywords(title, keywords):
+                                link = card.find('a', href=True)
+                                company_elem = card.find(class_=re.compile(r'company|startup'))
+                                
+                                job_data = {
+                                    'title': title,
+                                    'company': company_elem.get_text(strip=True) if company_elem else 'Startup',
+                                    'location': 'Various',
+                                    'url': urljoin("https://wellfound.com", link['href']) if link else '',
+                                    'posted': 'Recent',
+                                    'source': 'Wellfound'
+                                }
+                                self.add_job_if_new(job_data, jobs)
+                    except:
+                        continue
+                
+                print(f"Wellfound: Found {len(jobs)} new jobs")
+        except Exception as e:
+            print(f"Error scraping Wellfound: {e}")
+        return jobs
+    
+    def search_adzuna(self, keywords):
+        """Search Adzuna API"""
+        jobs = []
+        if not ADZUNA_APP_ID or not ADZUNA_APP_KEY:
+            print("Adzuna: Skipped (API credentials not set)")
+            return jobs
+        
+        try:
+            print("Searching Adzuna...")
+            # Search in US with remote filter
+            for keyword in keywords[:3]:  # Limit to 3 keywords to avoid too many API calls
+                url = f"https://api.adzuna.com/v1/api/jobs/us/search/1"
+                params = {
+                    'app_id': ADZUNA_APP_ID,
+                    'app_key': ADZUNA_APP_KEY,
+                    'results_per_page': 20,
+                    'what': keyword,
+                    'where': 'remote',
+                    'sort_by': 'date'
+                }
+                
+                response = requests.get(url, params=params, timeout=15)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    results = data.get('results', [])
+                    
+                    for job in results:
+                        title = job.get('title', '')
+                        company = job.get('company', {}).get('display_name', 'N/A')
+                        location = job.get('location', {}).get('display_name', 'Remote')
+                        url = job.get('redirect_url', '')
+                        created = job.get('created', 'Recent')
+                        
+                        job_data = {
+                            'title': title,
+                            'company': company,
+                            'location': location,
+                            'url': url,
+                            'posted': created,
+                            'source': 'Adzuna'
+                        }
+                        self.add_job_if_new(job_data, jobs)
+                
+                time.sleep(1)  # Rate limiting
+            
+            print(f"Adzuna: Found {len(jobs)} new jobs")
+        except Exception as e:
+            print(f"Error searching Adzuna: {e}")
+        return jobs
+    
+    def search_himalayas(self, keywords):
+        """Scrape Himalayas.app"""
+        jobs = []
+        try:
+            print("Searching Himalayas...")
+            response = requests.get("https://himalayas.app/jobs", headers=self.headers, timeout=15)
+            
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.content, 'html.parser')
+                job_items = soup.find_all(['div', 'article'], class_=re.compile(r'job'))
+                
+                for item in job_items[:30]:
+                    try:
+                        title_elem = item.find(['h2', 'h3', 'a'])
+                        if title_elem:
+                            title = title_elem.get_text(strip=True)
+                            
+                            if self.matches_keywords(title, keywords):
+                                link = item.find('a', href=True)
+                                company_elem = item.find(class_=re.compile(r'company'))
+                                
+                                job_data = {
+                                    'title': title,
+                                    'company': company_elem.get_text(strip=True) if company_elem else 'Various',
+                                    'location': 'Remote',
+                                    'url': urljoin("https://himalayas.app", link['href']) if link else '',
+                                    'posted': 'Recent',
+                                    'source': 'Himalayas'
+                                }
+                                self.add_job_if_new(job_data, jobs)
+                    except:
+                        continue
+                
+                print(f"Himalayas: Found {len(jobs)} new jobs")
+        except Exception as e:
+            print(f"Error scraping Himalayas: {e}")
+        return jobs
+    
+    def search_flexjobs(self, keywords):
+        """Scrape FlexJobs public listings"""
+        jobs = []
+        try:
+            print("Searching FlexJobs...")
+            # Note: FlexJobs is mostly paywalled, but some public listings exist
+            response = requests.get("https://www.flexjobs.com/search", headers=self.headers, timeout=15)
+            
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.content, 'html.parser')
+                job_cards = soup.find_all(['div', 'article'], class_=re.compile(r'job'))
+                
+                for card in job_cards[:20]:
+                    try:
+                        title_elem = card.find(['h2', 'h3', 'h4', 'a'])
+                        if title_elem:
+                            title = title_elem.get_text(strip=True)
+                            
+                            if self.matches_keywords(title, keywords):
+                                link = card.find('a', href=True)
+                                company_elem = card.find(class_=re.compile(r'company'))
+                                
+                                job_data = {
+                                    'title': title,
+                                    'company': company_elem.get_text(strip=True) if company_elem else 'Various',
+                                    'location': 'Remote',
+                                    'url': urljoin("https://www.flexjobs.com", link['href']) if link else '',
+                                    'posted': 'Recent',
+                                    'source': 'FlexJobs'
+                                }
+                                self.add_job_if_new(job_data, jobs)
+                    except:
+                        continue
+                
+                print(f"FlexJobs: Found {len(jobs)} new jobs")
+        except Exception as e:
+            print(f"Error scraping FlexJobs: {e}")
+        return jobs
+    
+    # ========== OPTIONAL SITES (may have issues) ==========
+    
+    def search_remoterocketship(self, keywords):
+        """Scrape Remote Rocketship"""
+        jobs = []
+        try:
+            print("Searching RemoteRocketship...")
+            response = requests.get("https://www.remoterocketship.com/", headers=self.headers, timeout=15)
+            
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.content, 'html.parser')
+                job_cards = soup.find_all('a', href=re.compile(r'/jobs/'))
+                
+                for card in job_cards[:20]:
+                    try:
+                        title = card.get_text(strip=True)
+                        url = urljoin("https://www.remoterocketship.com", card['href'])
+                        
+                        if self.matches_keywords(title, keywords):
+                            job_data = {
+                                'title': title,
+                                'company': 'Various',
+                                'location': 'Remote',
+                                'url': url,
+                                'posted': 'Recent',
+                                'source': 'RemoteRocketship'
+                            }
+                            self.add_job_if_new(job_data, jobs)
+                    except:
+                        continue
+                
+                print(f"RemoteRocketship: Found {len(jobs)} new jobs")
+        except Exception as e:
+            print(f"Error scraping RemoteRocketship: {e}")
+        return jobs
+    
+    def search_workinstartups(self, keywords):
+        """Scrape Work in Startups"""
+        jobs = []
+        try:
+            print("Searching WorkInStartups...")
+            response = requests.get("https://workinstartups.com/job-board/", headers=self.headers, timeout=15)
+            
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.content, 'html.parser')
+                job_listings = soup.find_all('div', class_=re.compile(r'job'))
+                
+                for job in job_listings[:20]:
+                    try:
+                        title_elem = job.find(['h3', 'h2', 'a'])
+                        if title_elem:
+                            title = title_elem.get_text(strip=True)
+                            
+                            if self.matches_keywords(title, keywords):
+                                link = job.find('a', href=True)
+                                url = urljoin("https://workinstartups.com", link['href']) if link else ''
+                                
+                                job_data = {
+                                    'title': title,
+                                    'company': 'Startup',
+                                    'location': 'Various',
+                                    'url': url,
+                                    'posted': 'Recent',
+                                    'source': 'WorkInStartups'
+                                }
+                                self.add_job_if_new(job_data, jobs)
+                    except:
+                        continue
+                
+                print(f"WorkInStartups: Found {len(jobs)} new jobs")
+        except Exception as e:
+            print(f"Error scraping WorkInStartups: {e}")
+        return jobs
+    
+    def search_hiringcafe(self, keywords):
+        """Scrape Hiring Cafe"""
+        jobs = []
+        try:
+            print("Searching HiringCafe...")
+            response = requests.get("https://hiring.cafe/", headers=self.headers, timeout=15)
+            
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.content, 'html.parser')
+                job_items = soup.find_all(['div', 'article'], class_=re.compile(r'job', re.I))
+                
+                for item in job_items[:20]:
+                    try:
+                        title_elem = item.find(['h2', 'h3', 'a'])
+                        if title_elem:
+                            title = title_elem.get_text(strip=True)
+                            
+                            if self.matches_keywords(title, keywords):
+                                link = item.find('a', href=True)
+                                url = link['href'] if link else ''
+                                
+                                job_data = {
+                                    'title': title,
+                                    'company': 'Various',
+                                    'location': 'Remote',
+                                    'url': url if url.startswith('http') else urljoin("https://hiring.cafe", url),
+                                    'posted': 'Recent',
+                                    'source': 'HiringCafe'
+                                }
+                                self.add_job_if_new(job_data, jobs)
+                    except:
+                        continue
+                
+                print(f"HiringCafe: Found {len(jobs)} new jobs")
+        except Exception as e:
+            print(f"Error scraping HiringCafe: {e}")
+        return jobs
+    
     def search_all_sites(self, keywords):
         """Search all configured job sites"""
         all_jobs = []
         
-        # Original sites
+        print("🔍 Searching primary job sites...\n")
+        
+        # Original reliable sites
         all_jobs.extend(self.search_remoteok(keywords))
+        time.sleep(1)
+        all_jobs.extend(self.search_remoteok_devjobs(keywords))
         time.sleep(1)
         all_jobs.extend(self.search_weworkremotely(keywords))
         time.sleep(1)
         all_jobs.extend(self.search_remotive(keywords))
         time.sleep(1)
         
-        # Your new sites
-        all_jobs.extend(self.search_remoterocketship(keywords))
-        time.sleep(1)
+        # Web3/Crypto sites
+        print("\n🌐 Searching Web3/Crypto sites...\n")
         all_jobs.extend(self.search_bitcoinerjobs(keywords))
         time.sleep(1)
         all_jobs.extend(self.search_web3career(keywords))
@@ -699,6 +902,9 @@ class JobSiteScraper:
         time.sleep(1)
         all_jobs.extend(self.search_laborx(keywords))
         time.sleep(1)
+        
+        # General remote sites
+        print("\n🏠 Searching general remote sites...\n")
         all_jobs.extend(self.search_dailyremote(keywords))
         time.sleep(1)
         all_jobs.extend(self.search_justremote(keywords))
@@ -706,21 +912,38 @@ class JobSiteScraper:
         all_jobs.extend(self.search_workingnomads(keywords))
         time.sleep(1)
         all_jobs.extend(self.search_remoteco(keywords))
+        time.sleep(1)
         
-        # Note: workinstartups, hiringcafe, daomatch, web3jobs, jobspresso 
-        # may have anti-scraping measures or complex structures
-        # Try them but they might not always work
+        # NEW sites
+        print("\n✨ Searching NEW sites...\n")
+        all_jobs.extend(self.search_wellfound(keywords))
+        time.sleep(1)
+        all_jobs.extend(self.search_adzuna(keywords))
+        time.sleep(1)
+        all_jobs.extend(self.search_himalayas(keywords))
+        time.sleep(1)
+        all_jobs.extend(self.search_flexjobs(keywords))
+        time.sleep(1)
+        
+        # Optional sites (may have issues)
+        print("\n⚠️  Checking optional sites...\n")
+        try:
+            all_jobs.extend(self.search_remoterocketship(keywords))
+            time.sleep(1)
+        except:
+            print("RemoteRocketship: Skipped")
+        
         try:
             all_jobs.extend(self.search_workinstartups(keywords))
             time.sleep(1)
         except:
-            print("WorkInStartups: Skipped (may have anti-scraping)")
+            print("WorkInStartups: Skipped")
         
         try:
             all_jobs.extend(self.search_hiringcafe(keywords))
             time.sleep(1)
         except:
-            print("HiringCafe: Skipped (may have anti-scraping)")
+            print("HiringCafe: Skipped")
         
         self.save_seen_jobs()
         return all_jobs
@@ -851,11 +1074,11 @@ def main():
     """Main function to run the job search"""
     print("="*80)
     print("JOB MONITORING BOT - GitHub Actions Edition")
+    print("Now monitoring 23+ job sites including Wellfound, Adzuna, Himalayas & more!")
     print("="*80)
     print(f"🕐 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}")
     print(f"🔍 Keywords: {', '.join(SEARCH_KEYWORDS)}")
     print(f"📬 Notification: {NOTIFICATION_METHOD}")
-    print(f"🌐 Searching 18+ job sites...")
     print("="*80)
     print()
     
@@ -863,7 +1086,7 @@ def main():
     scraper = JobSiteScraper()
     
     # Search for jobs
-    print("Starting comprehensive job search...\n")
+    print("Starting comprehensive job search across 23+ sites...\n")
     new_jobs = scraper.search_all_sites(SEARCH_KEYWORDS)
     
     print("\n" + "="*80)
