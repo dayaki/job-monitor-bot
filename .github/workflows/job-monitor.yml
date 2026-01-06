@@ -6,81 +6,80 @@ name: Job Monitor Bot
 on:
   schedule:
     # Run every hour at minute 0 (00:00, 01:00, 02:00, etc.)
-    - cron: '0 * * * *'
-  
-  workflow_dispatch:  # Allows manual trigger from GitHub Actions tab
+    - cron: "0 * * * *"
+
+  workflow_dispatch: # Allows manual trigger from GitHub Actions tab
 
 jobs:
   search-jobs:
     runs-on: ubuntu-latest
     permissions:
-      contents: write  # Required to commit and push changes
-    
+      contents: write # Required to commit and push changes
+
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
-      with:
-        token: ${{ secrets.GITHUB_TOKEN }}
-    
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.10'
-    
-    - name: Cache pip dependencies
-      uses: actions/cache@v3
-      with:
-        path: ~/.cache/pip
-        key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-        restore-keys: |
-          ${{ runner.os }}-pip-
-    
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
-    
-    - name: Download previous seen jobs
-      continue-on-error: true
-      run: |
-        if [ -f seen_jobs.json ]; then
-          echo "Found existing seen_jobs.json"
-        else
-          echo "No previous seen_jobs.json found, creating empty one"
-          echo "[]" > seen_jobs.json
-        fi
-    
-    - name: Run job search
-      env:
-        SEARCH_KEYWORDS: ${{ secrets.SEARCH_KEYWORDS }}
-        NOTIFICATION_METHOD: ${{ secrets.NOTIFICATION_METHOD }}
-        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
-        EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-        EMAIL_RECIPIENT: ${{ secrets.EMAIL_RECIPIENT }}
-        ADZUNA_APP_ID: ${{ secrets.ADZUNA_APP_ID }}
-        ADZUNA_APP_KEY: ${{ secrets.ADZUNA_APP_KEY }}
-        GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-        GOOGLE_CSE_ID: ${{ secrets.GOOGLE_CSE_ID }}
-      run: |
-        python job_monitor.py
-    
-    - name: Commit and push seen jobs
-      run: |
-        git config --local user.email "github-actions[bot]@users.noreply.github.com"
-        git config --local user.name "github-actions[bot]"
-        git add seen_jobs.json
-        if ! git diff --quiet --cached; then
-          git commit -m "Update seen jobs [skip ci]"
-          git push
-          echo "✓ Seen jobs updated and pushed"
-        else
-          echo "ℹ No changes to seen jobs"
-        fi
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Download previous seen jobs
+        continue-on-error: true
+        run: |
+          if [ -f seen_jobs.json ]; then
+            echo "Found existing seen_jobs.json"
+          else
+            echo "No previous seen_jobs.json found, creating empty one"
+            echo "[]" > seen_jobs.json
+          fi
+
+      - name: Run job search
+        env:
+          SEARCH_KEYWORDS: ${{ secrets.SEARCH_KEYWORDS }}
+          NOTIFICATION_METHOD: ${{ secrets.NOTIFICATION_METHOD }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_RECIPIENT: ${{ secrets.EMAIL_RECIPIENT }}
+          ADZUNA_APP_ID: ${{ secrets.ADZUNA_APP_ID }}
+          ADZUNA_APP_KEY: ${{ secrets.ADZUNA_APP_KEY }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          GOOGLE_CSE_ID: ${{ secrets.GOOGLE_CSE_ID }}
+        run: |
+          python job_monitor.py
+
+      - name: Commit and push seen jobs
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add seen_jobs.json
+          if ! git diff --quiet --cached; then
+            git commit -m "Update seen jobs [skip ci]"
+            git push
+            echo "✓ Seen jobs updated and pushed"
+          else
+            echo "ℹ No changes to seen jobs"
+          fi
 
 ---
-
 # Alternative schedule options (choose one and replace the cron line above):
 
 # Every 2 hours:
