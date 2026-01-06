@@ -1,0 +1,321 @@
+# Job Site Configuration
+# Each site has: name, url, type (api/html), selectors, and optional fallback selectors
+
+sites:
+  # ========== PRIMARY REMOTE SITES ==========
+  remoteok_api:
+    name: "RemoteOK"
+    url: "https://remoteok.com/api"
+    type: "api"
+    enabled: true
+    max_jobs: 50
+
+  remoteok_dev:
+    name: "RemoteOK-Dev"
+    url: "https://remoteok.com/remote-dev-jobs"
+    type: "html"
+    enabled: true
+    max_jobs: 30
+    selectors:
+      job_container: "tr.job"
+      title: "h2[itemprop='title']"
+      company: "h3[itemprop='name']"
+      link: "a[itemprop='url']"
+    fallback_selectors:
+      job_container: "tr[data-slug]"
+      title: ".title, h2"
+      company: ".company, h3"
+      link: "a[href*='/remote-jobs/']"
+
+  weworkremotely:
+    name: "WeWorkRemotely"
+    url: "https://weworkremotely.com/categories/remote-programming-jobs"
+    type: "html"
+    enabled: true
+    max_jobs: 20
+    selectors:
+      job_container: "li.feature"
+      title: "span.title"
+      company: "span.company"
+      link: "a"
+    fallback_selectors:
+      job_container: "section.jobs li"
+      title: ".title"
+      company: ".company"
+      link: "a[href*='/remote-jobs/']"
+
+  remotive:
+    name: "Remotive"
+    url: "https://remotive.com/api/remote-jobs?category=software-dev"
+    type: "api"
+    enabled: true
+    max_jobs: 30
+
+  # ========== WEB3/CRYPTO SITES ==========
+  bitcoinerjobs:
+    name: "BitcoinerJobs"
+    url: "https://bitcoinerjobs.com/"
+    type: "html"
+    enabled: true
+    max_jobs: 20
+    selectors:
+      job_container: "a[href*='/job/']"
+      title: "self"
+    fallback_selectors:
+      job_container: ".job-listing a"
+      title: "self"
+
+  web3career:
+    name: "Web3Career"
+    url: "https://web3.career/"
+    type: "html"
+    enabled: true
+    max_jobs: 30
+    selectors:
+      job_container: "tr[class*='job'], tr[class*='table']"
+      title: "h2, a[class*='job-title']"
+      company: "[class*='company']"
+      link: "a"
+    fallback_selectors:
+      job_container: "table tr"
+      title: "td:first-child a"
+      company: "td:nth-child(2)"
+      link: "a[href*='/job/']"
+
+  remote3:
+    name: "Remote3"
+    url: "https://www.remote3.co/"
+    type: "html"
+    enabled: true
+    max_jobs: 20
+    selectors:
+      job_container: "div[class*='job'], article[class*='job']"
+      title: "h2, h3"
+      link: "a"
+    fallback_selectors:
+      job_container: ".job-card, .job-listing"
+      title: ".job-title, h3"
+      link: "a[href*='/job']"
+
+  protocolai:
+    name: "ProtocolAI"
+    url: "https://jobs.protocol.ai/jobs"
+    type: "html"
+    enabled: true
+    max_jobs: 20
+    selectors:
+      job_container: "div[class*='job'], li[class*='position']"
+      title: "h3, h2, a"
+      link: "a"
+    fallback_selectors:
+      job_container: ".job-listing, .position"
+      title: ".title, h3"
+      link: "a[href*='/job']"
+
+  cryptocurrencyjobs:
+    name: "CryptocurrencyJobs"
+    url: "https://cryptocurrencyjobs.co/"
+    type: "html"
+    enabled: true
+    max_jobs: 20
+    selectors:
+      job_container: "div[class*='job'], article[class*='job']"
+      title: "h2, h3, a"
+      link: "a"
+    fallback_selectors:
+      job_container: ".job-card"
+      title: ".job-title"
+      link: "a[href*='/job/']"
+
+  laborx:
+    name: "LaborX"
+    url: "https://laborx.com/jobs"
+    type: "html"
+    enabled: true
+    max_jobs: 20
+    selectors:
+      job_container: "div[class*='job'], article[class*='gig']"
+      title: "h2, h3, h4"
+      link: "a"
+    fallback_selectors:
+      job_container: ".gig-card, .job-item"
+      title: ".title"
+      link: "a[href*='/gig']"
+
+  # ========== GENERAL REMOTE SITES ==========
+  dailyremote:
+    name: "DailyRemote"
+    url: "https://dailyremote.com/"
+    type: "html"
+    enabled: true
+    max_jobs: 20
+    selectors:
+      job_container: "div[class*='job'], article[class*='job']"
+      title: "h2, h3, a"
+      company: "[class*='company']"
+      link: "a"
+    fallback_selectors:
+      job_container: ".job-listing"
+      title: ".job-title"
+      company: ".company-name"
+      link: "a[href*='/job/']"
+
+  justremote:
+    name: "JustRemote"
+    url: "https://justremote.co/remote-jobs"
+    type: "html"
+    enabled: true
+    max_jobs: 20
+    selectors:
+      job_container: "div[class*='job'], article[class*='job']"
+      title: "h2, h3"
+      company: "[class*='company']"
+      link: "a"
+    fallback_selectors:
+      job_container: ".job-card"
+      title: ".job-title"
+      company: ".company"
+      link: "a[href*='/job']"
+
+  workingnomads:
+    name: "WorkingNomads"
+    url: "https://www.workingnomads.com/jobs"
+    type: "html"
+    enabled: true
+    max_jobs: 20
+    selectors:
+      job_container: "li[class*='job'], div[class*='job']"
+      title: "h2, h3, a"
+      link: "a"
+    fallback_selectors:
+      job_container: ".job-listing"
+      title: ".title"
+      link: "a[href*='/job']"
+
+  remoteco:
+    name: "Remote.co"
+    url: "https://remote.co/remote-jobs/"
+    type: "html"
+    enabled: true
+    max_jobs: 20
+    selectors:
+      job_container: "div[class*='job'], article[class*='job']"
+      title: "h2, h3, a"
+      company: "[class*='company']"
+      link: "a"
+    fallback_selectors:
+      job_container: ".job_listing"
+      title: ".position"
+      company: ".company"
+      link: "a[href*='/job/']"
+
+  # ========== STARTUP/TECH SITES ==========
+  wellfound:
+    name: "Wellfound"
+    url: "https://wellfound.com/jobs"
+    type: "html"
+    enabled: true
+    max_jobs: 30
+    selectors:
+      job_container: "div[class*='job'], article[class*='startup']"
+      title: "h2, h3, a[class*='title']"
+      company: "[class*='company'], [class*='startup']"
+      link: "a"
+    fallback_selectors:
+      job_container: ".styles_component__"
+      title: "[class*='jobTitle']"
+      company: "[class*='companyName']"
+      link: "a[href*='/jobs/']"
+
+  himalayas:
+    name: "Himalayas"
+    url: "https://himalayas.app/jobs"
+    type: "html"
+    enabled: true
+    max_jobs: 30
+    selectors:
+      job_container: "div[class*='job'], article[class*='job']"
+      title: "h2, h3, a"
+      company: "[class*='company']"
+      link: "a"
+    fallback_selectors:
+      job_container: "[data-job-id]"
+      title: ".job-title"
+      company: ".company-name"
+      link: "a[href*='/jobs/']"
+
+  flexjobs:
+    name: "FlexJobs"
+    url: "https://www.flexjobs.com/search"
+    type: "html"
+    enabled: true
+    max_jobs: 20
+    selectors:
+      job_container: "div[class*='job'], article[class*='job']"
+      title: "h2, h3, h4, a"
+      company: "[class*='company']"
+      link: "a"
+    fallback_selectors:
+      job_container: ".job-tile"
+      title: ".job-title"
+      company: ".company"
+      link: "a[href*='/job/']"
+
+  # ========== OPTIONAL SITES ==========
+  remoterocketship:
+    name: "RemoteRocketship"
+    url: "https://www.remoterocketship.com/"
+    type: "html"
+    enabled: true
+    max_jobs: 20
+    selectors:
+      job_container: "a[href*='/jobs/']"
+      title: "self"
+    fallback_selectors:
+      job_container: ".job-link"
+      title: "self"
+
+  workinstartups:
+    name: "WorkInStartups"
+    url: "https://workinstartups.com/job-board/"
+    type: "html"
+    enabled: true
+    max_jobs: 20
+    selectors:
+      job_container: "div[class*='job']"
+      title: "h3, h2, a"
+      link: "a"
+    fallback_selectors:
+      job_container: ".job-listing"
+      title: ".job-title"
+      link: "a[href*='/job/']"
+
+  hiringcafe:
+    name: "HiringCafe"
+    url: "https://hiring.cafe/"
+    type: "html"
+    enabled: true
+    max_jobs: 20
+    selectors:
+      job_container: "div[class*='job'], article[class*='job']"
+      title: "h2, h3, a"
+      link: "a"
+    fallback_selectors:
+      job_container: ".job-card"
+      title: ".title"
+      link: "a[href*='/job']"
+
+# Adzuna API (requires credentials)
+adzuna:
+  enabled: true
+  countries: ["us"]
+  results_per_page: 20
+  max_keywords: 3
+
+# Request settings
+request:
+  timeout: 15
+  max_retries: 3
+  retry_base_delay: 1.0
+  retry_max_delay: 10.0
+  concurrent_limit: 10

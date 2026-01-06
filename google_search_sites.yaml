@@ -1,0 +1,64 @@
+# Google Custom Search Sites Configuration
+# Add sites and keywords to search for jobs using Google Custom Search API
+#
+# Format:
+#   - Each entry under 'sites' defines a job board domain to search
+#   - 'keywords' are combined with each site to form search queries
+#   - Example query: "React Native" site:greenhouse.io remote
+#
+# Requirements:
+#   - GOOGLE_API_KEY: Your Google Cloud API key
+#   - GOOGLE_CSE_ID: Your Custom Search Engine ID
+#
+# Setup:
+#   1. Create a Google Cloud project: https://console.cloud.google.com/
+#   2. Enable "Custom Search API"
+#   3. Create API credentials (API Key)
+#   4. Create a Programmable Search Engine: https://programmablesearchengine.google.com/
+#   5. Set it to "Search the entire web"
+#   6. Copy the Search Engine ID
+
+settings:
+  enabled: true
+  max_results_per_query: 10
+  # Date restrict: limit results to recent posts
+  # Options: d[number] = days, w[number] = weeks, m[number] = months
+  # Example: d7 = last 7 days, w2 = last 2 weeks
+  date_restrict: "w1"
+
+# Keywords to search for (combined with each site)
+# Use quotes for exact phrases
+keywords:
+  - '"React Native"'
+  - '"React Native Developer"'
+  - '"Mobile Developer" React'
+  - '"Frontend Developer" React'
+  - '"Full Stack" React Native'
+
+# Job board sites to search
+# Each site will be searched with: "{keyword} site:{domain} remote"
+sites:
+  # ===== ATS Platforms =====
+  - domain: "greenhouse.io"
+    name: "Greenhouse"
+
+  - domain: "ashbyhq.com"
+    name: "Ashby"
+
+  - domain: "lever.co"
+    name: "Lever"
+
+  - domain: "jobs.workable.com"
+    name: "Workable"
+
+  - domain: "remoterocketship.com"
+    name: "Remote Rocketship"
+
+  - domain: "wellfound.com"
+    name: "Wellfound"
+
+  - domain: "recruitee.com"
+    name: "Recruitee"
+
+  - domain: "applytojob.com"
+    name: "ApplyToJob"
