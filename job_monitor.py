@@ -1,1136 +1,810 @@
 """
-Job Site Monitoring Bot - GitHub Actions Version with 20+ Job Sites
-Checks multiple job sites for new postings and sends notifications
+Job Site Monitoring Bot - Async Version with 20+ Job Sites
+Checks multiple job sites for new postings and sends Telegram notifications
+Features: Async scraping, retry logic, YAML config, structured logging
 """
 
-import requests
-from bs4 import BeautifulSoup
-import json
+import argparse
+import asyncio
+import aiohttp
 import hashlib
+import json
+import logging
 import os
 import re
-import time
+import sys
 from datetime import datetime
-from urllib.parse import urljoin, urlparse, parse_qs, quote
+from pathlib import Path
+from typing import Optional
+from urllib.parse import urljoin, quote_plus
+
+import yaml
+from bs4 import BeautifulSoup
+
+# ============= LOGGING SETUP =============
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger('job_monitor')
 
 # ============= CONFIGURATION FROM ENVIRONMENT =============
-SEARCH_KEYWORDS = os.getenv('SEARCH_KEYWORDS', 'python developer,software engineer,backend developer').split(',')
-SEARCH_KEYWORDS = [kw.strip() for kw in SEARCH_KEYWORDS]
+SEARCH_KEYWORDS = os.getenv('SEARCH_KEYWORDS', 'react,react native,mobile').split(',')
+SEARCH_KEYWORDS = [kw.strip().lower() for kw in SEARCH_KEYWORDS]
 
-NOTIFICATION_METHOD = os.getenv('NOTIFICATION_METHOD', 'telegram')
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 
-EMAIL_SENDER = os.getenv('EMAIL_SENDER', '')
-EMAIL_PASSWORD = os.getenv('EMAIL_PASSWORD', '')
-EMAIL_RECIPIENT = os.getenv('EMAIL_RECIPIENT', '')
-
-# Adzuna API credentials (optional - get from https://developer.adzuna.com/)
 ADZUNA_APP_ID = os.getenv('ADZUNA_APP_ID', '')
 ADZUNA_APP_KEY = os.getenv('ADZUNA_APP_KEY', '')
 
-# ============= JOB SITE SCRAPERS =============
+GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY', '')
+GOOGLE_CSE_ID = os.getenv('GOOGLE_CSE_ID', '')
 
-class JobSiteScraper:
-    def __init__(self, seen_jobs_file='seen_jobs.json'):
+# ============= LOAD YAML CONFIG =============
+CONFIG_PATH = Path(__file__).parent / 'sites_config.yaml'
+GOOGLE_SEARCH_CONFIG_PATH = Path(__file__).parent / 'google_search_sites.yaml'
+
+def load_config() -> dict:
+    try:
+        if CONFIG_PATH.exists():
+            with open(CONFIG_PATH, 'r') as f:
+                return yaml.safe_load(f)
+        logger.warning(f"Config file not found at {CONFIG_PATH}, using defaults")
+        return {'sites': {}, 'request': {}}
+    except Exception as e:
+        logger.error(f"Error loading config: {e}")
+        return {'sites': {}, 'request': {}}
+
+def load_google_search_config() -> dict:
+    try:
+        if GOOGLE_SEARCH_CONFIG_PATH.exists():
+            with open(GOOGLE_SEARCH_CONFIG_PATH, 'r') as f:
+                return yaml.safe_load(f)
+        logger.warning(f"Google search config not found at {GOOGLE_SEARCH_CONFIG_PATH}")
+        return {'settings': {'enabled': False}, 'keywords': [], 'sites': []}
+    except Exception as e:
+        logger.error(f"Error loading Google search config: {e}")
+        return {'settings': {'enabled': False}, 'keywords': [], 'sites': []}
+
+CONFIG = load_config()
+REQUEST_CONFIG = CONFIG.get('request', {})
+TIMEOUT = REQUEST_CONFIG.get('timeout', 15)
+MAX_RETRIES = REQUEST_CONFIG.get('max_retries', 3)
+RETRY_BASE_DELAY = REQUEST_CONFIG.get('retry_base_delay', 1.0)
+RETRY_MAX_DELAY = REQUEST_CONFIG.get('retry_max_delay', 10.0)
+CONCURRENT_LIMIT = REQUEST_CONFIG.get('concurrent_limit', 10)
+
+# ============= SCRAPER HEALTH TRACKING =============
+class ScraperHealth:
+    def __init__(self):
+        self.stats: dict[str, dict] = {}
+    
+    def record_success(self, site_name: str, job_count: int):
+        if site_name not in self.stats:
+            self.stats[site_name] = {'success': 0, 'failure': 0, 'jobs_found': 0}
+        self.stats[site_name]['success'] += 1
+        self.stats[site_name]['jobs_found'] += job_count
+    
+    def record_failure(self, site_name: str, error: str):
+        if site_name not in self.stats:
+            self.stats[site_name] = {'success': 0, 'failure': 0, 'jobs_found': 0, 'last_error': ''}
+        self.stats[site_name]['failure'] += 1
+        self.stats[site_name]['last_error'] = error
+    
+    def get_summary(self) -> str:
+        lines = ["Scraper Health Summary:"]
+        for site, stats in sorted(self.stats.items()):
+            status = "✓" if stats['success'] > 0 else "✗"
+            lines.append(f"  {status} {site}: {stats['jobs_found']} jobs, {stats['failure']} failures")
+        return "\n".join(lines)
+    
+    def get_failed_sites(self) -> list[dict]:
+        """Returns list of failed sites with their error reasons."""
+        failed = []
+        for site, stats in sorted(self.stats.items()):
+            if stats['success'] == 0 and stats['failure'] > 0:
+                failed.append({
+                    'site': site,
+                    'error': stats.get('last_error', 'Unknown error'),
+                    'failures': stats['failure']
+                })
+        return failed
+    
+    def get_working_sites(self) -> list[dict]:
+        """Returns list of working sites with job counts."""
+        working = []
+        for site, stats in sorted(self.stats.items()):
+            if stats['success'] > 0:
+                working.append({
+                    'site': site,
+                    'jobs_found': stats['jobs_found']
+                })
+        return working
+
+health_tracker = ScraperHealth()
+
+# ============= ASYNC HTTP CLIENT WITH RETRY =============
+class AsyncHTTPClient:
+    def __init__(self):
         self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/json, text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate',
         }
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._semaphore = asyncio.Semaphore(CONCURRENT_LIMIT)
+    
+    async def get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            timeout = aiohttp.ClientTimeout(total=TIMEOUT)
+            self._session = aiohttp.ClientSession(headers=self.headers, timeout=timeout)
+        return self._session
+    
+    async def close(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
+    
+    async def fetch(self, url: str, return_json: bool = False) -> Optional[str | dict]:
+        async with self._semaphore:
+            session = await self.get_session()
+            last_error = None
+            
+            for attempt in range(MAX_RETRIES):
+                try:
+                    async with session.get(url) as response:
+                        if response.status == 200:
+                            if return_json:
+                                text = await response.text()
+                                if not text or not text.strip():
+                                    logger.warning(f"Empty response from {url}")
+                                    return None
+                                try:
+                                    return json.loads(text)
+                                except json.JSONDecodeError as e:
+                                    logger.warning(f"Invalid JSON response from {url}: {e}")
+                                    logger.debug(f"Response content: {text[:500]}")
+                                    return None
+                            else:
+                                return await response.text()
+                        elif response.status == 429:
+                            delay = min(RETRY_BASE_DELAY * (2 ** attempt), RETRY_MAX_DELAY)
+                            logger.warning(f"Rate limited on {url}, waiting {delay}s")
+                            await asyncio.sleep(delay)
+                        elif response.status in (502, 503, 504):
+                            delay = min(RETRY_BASE_DELAY * (2 ** attempt), RETRY_MAX_DELAY)
+                            logger.warning(f"HTTP {response.status} for {url}, retrying in {delay}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                            await asyncio.sleep(delay)
+                            continue
+                        else:
+                            logger.warning(f"HTTP {response.status} for {url}")
+                            return None
+                except asyncio.TimeoutError:
+                    last_error = "timeout"
+                    logger.warning(f"Timeout fetching {url} (attempt {attempt + 1}/{MAX_RETRIES})")
+                except aiohttp.ClientError as e:
+                    last_error = str(e)
+                    logger.warning(f"Client error: {e} (attempt {attempt + 1}/{MAX_RETRIES})")
+                except Exception as e:
+                    logger.error(f"Unexpected error fetching {url}: {e}")
+                    return None
+                
+                if attempt < MAX_RETRIES - 1:
+                    delay = min(RETRY_BASE_DELAY * (2 ** attempt), RETRY_MAX_DELAY)
+                    await asyncio.sleep(delay)
+            
+            logger.error(f"Failed to fetch {url} after {MAX_RETRIES} attempts: {last_error}")
+            return None
+
+http_client = AsyncHTTPClient()
+
+# ============= JOB SITE SCRAPER =============
+class JobSiteScraper:
+    def __init__(self, seen_jobs_file: str = 'seen_jobs.json'):
         self.seen_jobs_file = seen_jobs_file
         self.seen_jobs = self.load_seen_jobs()
     
-    def load_seen_jobs(self):
-        """Load previously seen job IDs"""
+    def load_seen_jobs(self) -> set:
         try:
             if os.path.exists(self.seen_jobs_file):
                 with open(self.seen_jobs_file, 'r') as f:
                     return set(json.load(f))
             return set()
         except Exception as e:
-            print(f"Error loading seen jobs: {e}")
+            logger.error(f"Error loading seen jobs: {e}")
             return set()
     
     def save_seen_jobs(self):
-        """Save seen job IDs"""
         try:
             with open(self.seen_jobs_file, 'w') as f:
                 json.dump(list(self.seen_jobs), f)
-            print(f"Saved {len(self.seen_jobs)} seen jobs")
+            logger.info(f"Saved {len(self.seen_jobs)} seen jobs")
         except Exception as e:
-            print(f"Error saving seen jobs: {e}")
+            logger.error(f"Error saving seen jobs: {e}")
     
-    def generate_job_id(self, title, company, url):
-        """Generate unique ID for a job posting"""
-        unique_string = f"{title}|{company}|{url}"
+    def generate_job_id(self, title: str, company: str, url: str) -> str:
+        unique_string = f"{title}|{company}|{url}".lower()
         return hashlib.md5(unique_string.encode()).hexdigest()
     
-    def matches_keywords(self, text, keywords):
-        """Check if text matches any of the keywords"""
-        text_lower = text.lower()
-        return any(kw.lower() in text_lower for kw in keywords)
+    def matches_keywords(self, job: dict) -> bool:
+        searchable = f"{job.get('title', '')} {job.get('company', '')} {job.get('description', '')}".lower()
+        return any(kw in searchable for kw in SEARCH_KEYWORDS)
     
-    def add_job_if_new(self, job_data, jobs_list):
-        """Add job to list if it's new and not seen before"""
-        job_id = self.generate_job_id(job_data['title'], job_data['company'], job_data['url'])
-        if job_id not in self.seen_jobs:
-            jobs_list.append(job_data)
-            self.seen_jobs.add(job_id)
-            print(f"  ✓ New: {job_data['title']} at {job_data['company']}")
-            return True
-        return False
+    def is_new_job(self, job_id: str) -> bool:
+        return job_id not in self.seen_jobs
     
-    # ========== ORIGINAL SITES ==========
+    def mark_as_seen(self, job_id: str):
+        self.seen_jobs.add(job_id)
     
-    def search_remoteok(self, keywords):
-        """Scrape Remote OK"""
-        jobs = []
+    def parse_html(self, html: str) -> BeautifulSoup:
         try:
-            print("Searching RemoteOK...")
-            response = requests.get("https://remoteok.com/api", headers=self.headers, timeout=15)
-            
-            if response.status_code == 200:
-                data = response.json()[1:] if isinstance(response.json(), list) else []
-                
-                for job in data[:50]:
-                    if not isinstance(job, dict):
-                        continue
-                    
-                    title = job.get('position', '')
-                    tags = ' '.join(job.get('tags', []))
-                    
-                    if self.matches_keywords(f"{title} {tags}", keywords):
-                        job_data = {
-                            'title': title,
-                            'company': job.get('company', 'N/A'),
-                            'location': job.get('location', 'Remote'),
-                            'url': f"https://remoteok.com/remote-jobs/{job.get('slug', '')}",
-                            'posted': job.get('date', 'Recent'),
-                            'source': 'RemoteOK'
-                        }
-                        self.add_job_if_new(job_data, jobs)
-                
-                print(f"RemoteOK: Found {len(jobs)} new jobs")
-        except Exception as e:
-            print(f"Error scraping RemoteOK: {e}")
-        return jobs
-    
-    def search_remoteok_devjobs(self, keywords):
-        """Scrape RemoteOK remote-dev-jobs section"""
+            return BeautifulSoup(html, 'lxml')
+        except Exception:
+            return BeautifulSoup(html, 'html.parser')
+
+    # ============= API SCRAPERS (Custom - unique response structures) =============
+    async def scrape_remoteok_api(self) -> list[dict]:
         jobs = []
+        site_name = "RemoteOK-API"
         try:
-            print("Searching RemoteOK Dev Jobs...")
-            response = requests.get("https://remoteok.com/remote-dev-jobs", headers=self.headers, timeout=15)
+            data = await http_client.fetch("https://remoteok.com/api", return_json=True)
+            if not data or not isinstance(data, list):
+                health_tracker.record_failure(site_name, "Invalid response")
+                return jobs
             
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.content, 'html.parser')
-                job_rows = soup.find_all('tr', class_='job')
+            for item in data[1:51]:
+                if not isinstance(item, dict):
+                    continue
+                title = item.get('position', '')
+                company = item.get('company', '')
+                url = item.get('url', '')
                 
-                for row in job_rows[:30]:
-                    try:
-                        title_elem = row.find('h2', itemprop='title')
-                        company_elem = row.find('h3', itemprop='name')
-                        link_elem = row.find('a', itemprop='url')
-                        
-                        if title_elem and link_elem:
-                            title = title_elem.get_text(strip=True)
-                            
-                            if self.matches_keywords(title, keywords):
-                                job_data = {
-                                    'title': title,
-                                    'company': company_elem.get_text(strip=True) if company_elem else 'N/A',
-                                    'location': 'Remote',
-                                    'url': f"https://remoteok.com{link_elem['href']}",
-                                    'posted': 'Recent',
-                                    'source': 'RemoteOK-Dev'
-                                }
-                                self.add_job_if_new(job_data, jobs)
-                    except:
-                        continue
+                if not title or not url:
+                    continue
                 
-                print(f"RemoteOK Dev: Found {len(jobs)} new jobs")
+                job = {'title': title, 'company': company, 'url': url, 'source': site_name, 'description': item.get('description', '')}
+                job_id = self.generate_job_id(title, company, url)
+                if self.is_new_job(job_id) and self.matches_keywords(job):
+                    job['id'] = job_id
+                    jobs.append(job)
+                    self.mark_as_seen(job_id)
+            
+            health_tracker.record_success(site_name, len(jobs))
+            logger.info(f"{site_name}: Found {len(jobs)} new matching jobs")
         except Exception as e:
-            print(f"Error scraping RemoteOK Dev: {e}")
+            health_tracker.record_failure(site_name, str(e))
+            logger.error(f"{site_name} error: {e}")
         return jobs
-    
-    def search_weworkremotely(self, keywords):
-        """Scrape We Work Remotely"""
+
+    async def scrape_remotive_api(self) -> list[dict]:
         jobs = []
+        site_name = "Remotive"
         try:
-            print("Searching WeWorkRemotely...")
-            response = requests.get("https://weworkremotely.com/categories/remote-programming-jobs", 
-                                  headers=self.headers, timeout=15)
+            data = await http_client.fetch("https://remotive.com/api/remote-jobs?category=software-dev", return_json=True)
+            if not data or 'jobs' not in data:
+                health_tracker.record_failure(site_name, "Invalid response")
+                return jobs
             
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.content, 'html.parser')
-                job_listings = soup.find_all('li', class_='feature')
+            for item in data['jobs'][:30]:
+                title = item.get('title', '')
+                company = item.get('company_name', '')
+                url = item.get('url', '')
                 
-                for job in job_listings[:20]:
-                    try:
-                        title_elem = job.find('span', class_='title')
-                        company_elem = job.find('span', class_='company')
-                        link_elem = job.find('a')
-                        
-                        if title_elem and company_elem and link_elem:
-                            title = title_elem.text.strip()
-                            
-                            if self.matches_keywords(title, keywords):
-                                job_data = {
-                                    'title': title,
-                                    'company': company_elem.text.strip(),
-                                    'location': 'Remote',
-                                    'url': f"https://weworkremotely.com{link_elem['href']}",
-                                    'posted': 'Recent',
-                                    'source': 'WeWorkRemotely'
-                                }
-                                self.add_job_if_new(job_data, jobs)
-                    except:
-                        continue
+                if not title or not url:
+                    continue
                 
-                print(f"WeWorkRemotely: Found {len(jobs)} new jobs")
-        except Exception as e:
-            print(f"Error scraping WeWorkRemotely: {e}")
-        return jobs
-    
-    def search_remotive(self, keywords):
-        """Scrape Remotive.io"""
-        jobs = []
-        try:
-            print("Searching Remotive...")
-            response = requests.get("https://remotive.com/api/remote-jobs?category=software-dev", 
-                                  headers=self.headers, timeout=15)
+                job = {'title': title, 'company': company, 'url': url, 'source': site_name, 'description': item.get('description', '')}
+                job_id = self.generate_job_id(title, company, url)
+                if self.is_new_job(job_id) and self.matches_keywords(job):
+                    job['id'] = job_id
+                    jobs.append(job)
+                    self.mark_as_seen(job_id)
             
-            if response.status_code == 200:
-                data = response.json()
-                job_list = data.get('jobs', [])
-                
-                for job in job_list[:30]:
-                    title = job.get('title', '')
-                    
-                    if self.matches_keywords(title, keywords):
-                        job_data = {
-                            'title': title,
-                            'company': job.get('company_name', 'N/A'),
-                            'location': job.get('candidate_required_location', 'Remote'),
-                            'url': job.get('url', ''),
-                            'posted': job.get('publication_date', 'Recent'),
-                            'source': 'Remotive'
-                        }
-                        self.add_job_if_new(job_data, jobs)
-                
-                print(f"Remotive: Found {len(jobs)} new jobs")
+            health_tracker.record_success(site_name, len(jobs))
+            logger.info(f"{site_name}: Found {len(jobs)} new matching jobs")
         except Exception as e:
-            print(f"Error scraping Remotive: {e}")
+            health_tracker.record_failure(site_name, str(e))
+            logger.error(f"{site_name} error: {e}")
         return jobs
-    
-    # ========== WEB3/CRYPTO SITES ==========
-    
-    def search_bitcoinerjobs(self, keywords):
-        """Scrape Bitcoiner Jobs"""
+
+    async def scrape_adzuna(self) -> list[dict]:
         jobs = []
-        try:
-            print("Searching BitcoinerJobs...")
-            response = requests.get("https://bitcoinerjobs.com/", headers=self.headers, timeout=15)
-            
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.content, 'html.parser')
-                job_links = soup.find_all('a', href=re.compile(r'/job/'))
-                
-                for link in job_links[:20]:
-                    try:
-                        title = link.get_text(strip=True)
-                        
-                        if self.matches_keywords(title, keywords):
-                            job_data = {
-                                'title': title,
-                                'company': 'Bitcoin Company',
-                                'location': 'Remote',
-                                'url': urljoin("https://bitcoinerjobs.com", link['href']),
-                                'posted': 'Recent',
-                                'source': 'BitcoinerJobs'
-                            }
-                            self.add_job_if_new(job_data, jobs)
-                    except:
-                        continue
-                
-                print(f"BitcoinerJobs: Found {len(jobs)} new jobs")
-        except Exception as e:
-            print(f"Error scraping BitcoinerJobs: {e}")
-        return jobs
-    
-    def search_web3career(self, keywords):
-        """Scrape Web3 Career"""
-        jobs = []
-        try:
-            print("Searching Web3Career...")
-            response = requests.get("https://web3.career/", headers=self.headers, timeout=15)
-            
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.content, 'html.parser')
-                job_rows = soup.find_all('tr', class_=re.compile(r'job|table'))
-                
-                for row in job_rows[:30]:
-                    try:
-                        title_elem = row.find('h2') or row.find('a', class_=re.compile(r'job-title'))
-                        if title_elem:
-                            title = title_elem.get_text(strip=True)
-                            
-                            if self.matches_keywords(title, keywords):
-                                link = row.find('a', href=True)
-                                company_elem = row.find(class_=re.compile(r'company'))
-                                
-                                job_data = {
-                                    'title': title,
-                                    'company': company_elem.get_text(strip=True) if company_elem else 'Web3 Company',
-                                    'location': 'Remote',
-                                    'url': urljoin("https://web3.career", link['href']) if link else '',
-                                    'posted': 'Recent',
-                                    'source': 'Web3Career'
-                                }
-                                self.add_job_if_new(job_data, jobs)
-                    except:
-                        continue
-                
-                print(f"Web3Career: Found {len(jobs)} new jobs")
-        except Exception as e:
-            print(f"Error scraping Web3Career: {e}")
-        return jobs
-    
-    def search_remote3(self, keywords):
-        """Scrape Remote3"""
-        jobs = []
-        try:
-            print("Searching Remote3...")
-            response = requests.get("https://www.remote3.co/", headers=self.headers, timeout=15)
-            
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.content, 'html.parser')
-                job_cards = soup.find_all(['div', 'article'], class_=re.compile(r'job'))
-                
-                for card in job_cards[:20]:
-                    try:
-                        title_elem = card.find(['h2', 'h3'])
-                        if title_elem:
-                            title = title_elem.get_text(strip=True)
-                            
-                            if self.matches_keywords(title, keywords):
-                                link = card.find('a', href=True)
-                                job_data = {
-                                    'title': title,
-                                    'company': 'Web3 Company',
-                                    'location': 'Remote',
-                                    'url': urljoin("https://www.remote3.co", link['href']) if link else '',
-                                    'posted': 'Recent',
-                                    'source': 'Remote3'
-                                }
-                                self.add_job_if_new(job_data, jobs)
-                    except:
-                        continue
-                
-                print(f"Remote3: Found {len(jobs)} new jobs")
-        except Exception as e:
-            print(f"Error scraping Remote3: {e}")
-        return jobs
-    
-    def search_protocolai(self, keywords):
-        """Scrape Protocol Labs Jobs"""
-        jobs = []
-        try:
-            print("Searching Protocol AI...")
-            response = requests.get("https://jobs.protocol.ai/jobs", headers=self.headers, timeout=15)
-            
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.content, 'html.parser')
-                job_listings = soup.find_all(['div', 'li'], class_=re.compile(r'job|position'))
-                
-                for listing in job_listings[:20]:
-                    try:
-                        title_elem = listing.find(['h3', 'h2', 'a'])
-                        if title_elem:
-                            title = title_elem.get_text(strip=True)
-                            
-                            if self.matches_keywords(title, keywords):
-                                link = listing.find('a', href=True)
-                                job_data = {
-                                    'title': title,
-                                    'company': 'Protocol Labs',
-                                    'location': 'Remote',
-                                    'url': urljoin("https://jobs.protocol.ai", link['href']) if link else '',
-                                    'posted': 'Recent',
-                                    'source': 'ProtocolAI'
-                                }
-                                self.add_job_if_new(job_data, jobs)
-                    except:
-                        continue
-                
-                print(f"Protocol AI: Found {len(jobs)} new jobs")
-        except Exception as e:
-            print(f"Error scraping Protocol AI: {e}")
-        return jobs
-    
-    def search_cryptocurrencyjobs(self, keywords):
-        """Scrape Cryptocurrency Jobs"""
-        jobs = []
-        try:
-            print("Searching CryptocurrencyJobs...")
-            response = requests.get("https://cryptocurrencyjobs.co/", headers=self.headers, timeout=15)
-            
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.content, 'html.parser')
-                job_items = soup.find_all(['div', 'article'], class_=re.compile(r'job'))
-                
-                for item in job_items[:20]:
-                    try:
-                        title_elem = item.find(['h2', 'h3', 'a'])
-                        if title_elem:
-                            title = title_elem.get_text(strip=True)
-                            
-                            if self.matches_keywords(title, keywords):
-                                link = item.find('a', href=True)
-                                job_data = {
-                                    'title': title,
-                                    'company': 'Crypto Company',
-                                    'location': 'Remote',
-                                    'url': urljoin("https://cryptocurrencyjobs.co", link['href']) if link else '',
-                                    'posted': 'Recent',
-                                    'source': 'CryptocurrencyJobs'
-                                }
-                                self.add_job_if_new(job_data, jobs)
-                    except:
-                        continue
-                
-                print(f"CryptocurrencyJobs: Found {len(jobs)} new jobs")
-        except Exception as e:
-            print(f"Error scraping CryptocurrencyJobs: {e}")
-        return jobs
-    
-    def search_laborx(self, keywords):
-        """Scrape LaborX"""
-        jobs = []
-        try:
-            print("Searching LaborX...")
-            response = requests.get("https://laborx.com/jobs", headers=self.headers, timeout=15)
-            
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.content, 'html.parser')
-                job_cards = soup.find_all(['div', 'article'], class_=re.compile(r'job|gig'))
-                
-                for card in job_cards[:20]:
-                    try:
-                        title_elem = card.find(['h2', 'h3', 'h4'])
-                        if title_elem:
-                            title = title_elem.get_text(strip=True)
-                            
-                            if self.matches_keywords(title, keywords):
-                                link = card.find('a', href=True)
-                                job_data = {
-                                    'title': title,
-                                    'company': 'Crypto/Gig',
-                                    'location': 'Remote',
-                                    'url': urljoin("https://laborx.com", link['href']) if link else '',
-                                    'posted': 'Recent',
-                                    'source': 'LaborX'
-                                }
-                                self.add_job_if_new(job_data, jobs)
-                    except:
-                        continue
-                
-                print(f"LaborX: Found {len(jobs)} new jobs")
-        except Exception as e:
-            print(f"Error scraping LaborX: {e}")
-        return jobs
-    
-    # ========== GENERAL REMOTE SITES ==========
-    
-    def search_dailyremote(self, keywords):
-        """Scrape Daily Remote"""
-        jobs = []
-        try:
-            print("Searching DailyRemote...")
-            response = requests.get("https://dailyremote.com/", headers=self.headers, timeout=15)
-            
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.content, 'html.parser')
-                job_listings = soup.find_all(['div', 'article'], class_=re.compile(r'job'))
-                
-                for listing in job_listings[:20]:
-                    try:
-                        title_elem = listing.find(['h2', 'h3', 'a'])
-                        if title_elem:
-                            title = title_elem.get_text(strip=True)
-                            
-                            if self.matches_keywords(title, keywords):
-                                link = listing.find('a', href=True)
-                                company_elem = listing.find(class_=re.compile(r'company'))
-                                
-                                job_data = {
-                                    'title': title,
-                                    'company': company_elem.get_text(strip=True) if company_elem else 'Various',
-                                    'location': 'Remote',
-                                    'url': urljoin("https://dailyremote.com", link['href']) if link else '',
-                                    'posted': 'Recent',
-                                    'source': 'DailyRemote'
-                                }
-                                self.add_job_if_new(job_data, jobs)
-                    except:
-                        continue
-                
-                print(f"DailyRemote: Found {len(jobs)} new jobs")
-        except Exception as e:
-            print(f"Error scraping DailyRemote: {e}")
-        return jobs
-    
-    def search_justremote(self, keywords):
-        """Scrape JustRemote"""
-        jobs = []
-        try:
-            print("Searching JustRemote...")
-            response = requests.get("https://justremote.co/remote-jobs", headers=self.headers, timeout=15)
-            
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.content, 'html.parser')
-                job_cards = soup.find_all(['div', 'article'], class_=re.compile(r'job'))
-                
-                for card in job_cards[:20]:
-                    try:
-                        title_elem = card.find(['h2', 'h3'])
-                        if title_elem:
-                            title = title_elem.get_text(strip=True)
-                            
-                            if self.matches_keywords(title, keywords):
-                                link = card.find('a', href=True)
-                                company_elem = card.find(class_=re.compile(r'company'))
-                                
-                                job_data = {
-                                    'title': title,
-                                    'company': company_elem.get_text(strip=True) if company_elem else 'Various',
-                                    'location': 'Remote',
-                                    'url': urljoin("https://justremote.co", link['href']) if link else '',
-                                    'posted': 'Recent',
-                                    'source': 'JustRemote'
-                                }
-                                self.add_job_if_new(job_data, jobs)
-                    except:
-                        continue
-                
-                print(f"JustRemote: Found {len(jobs)} new jobs")
-        except Exception as e:
-            print(f"Error scraping JustRemote: {e}")
-        return jobs
-    
-    def search_workingnomads(self, keywords):
-        """Scrape Working Nomads"""
-        jobs = []
-        try:
-            print("Searching WorkingNomads...")
-            response = requests.get("https://www.workingnomads.com/jobs", headers=self.headers, timeout=15)
-            
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.content, 'html.parser')
-                job_listings = soup.find_all(['li', 'div'], class_=re.compile(r'job'))
-                
-                for listing in job_listings[:20]:
-                    try:
-                        title_elem = listing.find(['h2', 'h3', 'a'])
-                        if title_elem:
-                            title = title_elem.get_text(strip=True)
-                            
-                            if self.matches_keywords(title, keywords):
-                                link = listing.find('a', href=True)
-                                job_data = {
-                                    'title': title,
-                                    'company': 'Various',
-                                    'location': 'Remote',
-                                    'url': urljoin("https://www.workingnomads.com", link['href']) if link else '',
-                                    'posted': 'Recent',
-                                    'source': 'WorkingNomads'
-                                }
-                                self.add_job_if_new(job_data, jobs)
-                    except:
-                        continue
-                
-                print(f"WorkingNomads: Found {len(jobs)} new jobs")
-        except Exception as e:
-            print(f"Error scraping WorkingNomads: {e}")
-        return jobs
-    
-    def search_remoteco(self, keywords):
-        """Scrape Remote.co"""
-        jobs = []
-        try:
-            print("Searching Remote.co...")
-            response = requests.get("https://remote.co/remote-jobs/", headers=self.headers, timeout=15)
-            
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.content, 'html.parser')
-                job_cards = soup.find_all(['div', 'article'], class_=re.compile(r'job'))
-                
-                for card in job_cards[:20]:
-                    try:
-                        title_elem = card.find(['h2', 'h3', 'a'])
-                        if title_elem:
-                            title = title_elem.get_text(strip=True)
-                            
-                            if self.matches_keywords(title, keywords):
-                                link = card.find('a', href=True)
-                                company_elem = card.find(class_=re.compile(r'company'))
-                                
-                                job_data = {
-                                    'title': title,
-                                    'company': company_elem.get_text(strip=True) if company_elem else 'Various',
-                                    'location': 'Remote',
-                                    'url': urljoin("https://remote.co", link['href']) if link else '',
-                                    'posted': 'Recent',
-                                    'source': 'Remote.co'
-                                }
-                                self.add_job_if_new(job_data, jobs)
-                    except:
-                        continue
-                
-                print(f"Remote.co: Found {len(jobs)} new jobs")
-        except Exception as e:
-            print(f"Error scraping Remote.co: {e}")
-        return jobs
-    
-    # ========== NEW SITES ==========
-    
-    def search_wellfound(self, keywords):
-        """Scrape Wellfound (formerly AngelList)"""
-        jobs = []
-        try:
-            print("Searching Wellfound...")
-            # Try startup jobs page
-            response = requests.get("https://wellfound.com/jobs", headers=self.headers, timeout=15)
-            
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.content, 'html.parser')
-                job_cards = soup.find_all(['div', 'article'], class_=re.compile(r'job|startup'))
-                
-                for card in job_cards[:30]:
-                    try:
-                        title_elem = card.find(['h2', 'h3', 'a'], class_=re.compile(r'title|job'))
-                        if title_elem:
-                            title = title_elem.get_text(strip=True)
-                            
-                            if self.matches_keywords(title, keywords):
-                                link = card.find('a', href=True)
-                                company_elem = card.find(class_=re.compile(r'company|startup'))
-                                
-                                job_data = {
-                                    'title': title,
-                                    'company': company_elem.get_text(strip=True) if company_elem else 'Startup',
-                                    'location': 'Various',
-                                    'url': urljoin("https://wellfound.com", link['href']) if link else '',
-                                    'posted': 'Recent',
-                                    'source': 'Wellfound'
-                                }
-                                self.add_job_if_new(job_data, jobs)
-                    except:
-                        continue
-                
-                print(f"Wellfound: Found {len(jobs)} new jobs")
-        except Exception as e:
-            print(f"Error scraping Wellfound: {e}")
-        return jobs
-    
-    def search_adzuna(self, keywords):
-        """Search Adzuna API"""
-        jobs = []
+        site_name = "Adzuna"
+        
         if not ADZUNA_APP_ID or not ADZUNA_APP_KEY:
-            print("Adzuna: Skipped (API credentials not set)")
+            logger.debug(f"{site_name}: Skipped (no credentials)")
             return jobs
         
         try:
-            print("Searching Adzuna...")
-            # Search in US with remote filter
-            for keyword in keywords[:3]:  # Limit to 3 keywords to avoid too many API calls
-                url = f"https://api.adzuna.com/v1/api/jobs/us/search/1"
-                params = {
-                    'app_id': ADZUNA_APP_ID,
-                    'app_key': ADZUNA_APP_KEY,
-                    'results_per_page': 20,
-                    'what': keyword,
-                    'where': 'remote',
-                    'sort_by': 'date'
-                }
-                
-                response = requests.get(url, params=params, timeout=15)
-                
-                if response.status_code == 200:
-                    data = response.json()
-                    results = data.get('results', [])
+            adzuna_config = CONFIG.get('adzuna', {})
+            countries = adzuna_config.get('countries', ['us'])
+            results_per_page = adzuna_config.get('results_per_page', 20)
+            
+            for country in countries:
+                for keyword in SEARCH_KEYWORDS[:3]:
+                    encoded_keyword = quote_plus(keyword)
+                    url = f"https://api.adzuna.com/v1/api/jobs/{country}/search/1?app_id={ADZUNA_APP_ID}&app_key={ADZUNA_APP_KEY}&results_per_page={results_per_page}&what={encoded_keyword}"
                     
-                    for job in results:
-                        title = job.get('title', '')
-                        company = job.get('company', {}).get('display_name', 'N/A')
-                        location = job.get('location', {}).get('display_name', 'Remote')
-                        url = job.get('redirect_url', '')
-                        created = job.get('created', 'Recent')
+                    data = await http_client.fetch(url, return_json=True)
+                    
+                    if data is None:
+                        logger.warning(f"{site_name}: No response for keyword '{keyword}' in {country}")
+                        continue
+                    
+                    if isinstance(data, str):
+                        logger.warning(f"{site_name}: Got HTML instead of JSON - check API credentials")
+                        health_tracker.record_failure(site_name, "Invalid API credentials or rate limited")
+                        return jobs
+                    
+                    if 'error' in data:
+                        error_msg = data.get('error', {}).get('message', str(data.get('error')))
+                        logger.warning(f"{site_name}: API error - {error_msg}")
+                        continue
+                    
+                    if 'results' not in data:
+                        logger.debug(f"{site_name}: No results for keyword '{keyword}'")
+                        continue
+                    
+                    for item in data['results']:
+                        title = item.get('title', '')
+                        company = item.get('company', {}).get('display_name', '')
+                        job_url = item.get('redirect_url', '')
                         
-                        job_data = {
+                        if not title or not job_url:
+                            continue
+                        
+                        job = {'title': title, 'company': company, 'url': job_url, 'source': site_name}
+                        job_id = self.generate_job_id(title, company, job_url)
+                        if self.is_new_job(job_id) and self.matches_keywords(job):
+                            job['id'] = job_id
+                            jobs.append(job)
+                            self.mark_as_seen(job_id)
+            
+            health_tracker.record_success(site_name, len(jobs))
+            logger.info(f"{site_name}: Found {len(jobs)} new matching jobs")
+        except Exception as e:
+            health_tracker.record_failure(site_name, str(e))
+            logger.error(f"{site_name} error: {e}")
+        return jobs
+
+    # ============= GOOGLE CUSTOM SEARCH API =============
+    async def scrape_google_search(self) -> list[dict]:
+        """Search for jobs using Google Custom Search API."""
+        jobs = []
+        site_name = "GoogleSearch"
+        
+        if not GOOGLE_API_KEY or not GOOGLE_CSE_ID:
+            logger.debug(f"{site_name}: Skipped (no credentials)")
+            return jobs
+        
+        google_config = load_google_search_config()
+        settings = google_config.get('settings', {})
+        
+        if not settings.get('enabled', False):
+            logger.debug(f"{site_name}: Disabled in config")
+            return jobs
+        
+        keywords = google_config.get('keywords', [])
+        sites = google_config.get('sites', [])
+        max_results = settings.get('max_results_per_query', 10)
+        date_restrict = settings.get('date_restrict', 'w1')
+        
+        if not keywords or not sites:
+            logger.warning(f"{site_name}: No keywords or sites configured")
+            return jobs
+        
+        try:
+            total_queries = 0
+            
+            for site_entry in sites:
+                domain = site_entry.get('domain', '')
+                source_name = site_entry.get('name', domain)
+                
+                if not domain:
+                    continue
+                
+                for keyword in keywords:
+                    query = f'{keyword} site:{domain} remote'
+                    
+                    url = (
+                        f"https://www.googleapis.com/customsearch/v1"
+                        f"?key={GOOGLE_API_KEY}"
+                        f"&cx={GOOGLE_CSE_ID}"
+                        f"&q={query}"
+                        f"&num={max_results}"
+                        f"&dateRestrict={date_restrict}"
+                    )
+                    
+                    data = await http_client.fetch(url, return_json=True)
+                    total_queries += 1
+                    
+                    if not data:
+                        continue
+                    
+                    if 'error' in data:
+                        error_msg = data['error'].get('message', 'Unknown error')
+                        logger.warning(f"{site_name}: API error - {error_msg}")
+                        continue
+                    
+                    items = data.get('items', [])
+                    
+                    for item in items:
+                        title = item.get('title', '')
+                        job_url = item.get('link', '')
+                        snippet = item.get('snippet', '')
+                        
+                        if not title or not job_url:
+                            continue
+                        
+                        company = ''
+                        if ' - ' in title:
+                            parts = title.rsplit(' - ', 1)
+                            if len(parts) == 2:
+                                title, company = parts[0].strip(), parts[1].strip()
+                        elif ' | ' in title:
+                            parts = title.rsplit(' | ', 1)
+                            if len(parts) == 2:
+                                title, company = parts[0].strip(), parts[1].strip()
+                        
+                        job = {
                             'title': title,
                             'company': company,
-                            'location': location,
-                            'url': url,
-                            'posted': created,
-                            'source': 'Adzuna'
+                            'url': job_url,
+                            'source': f"Google-{source_name}",
+                            'description': snippet
                         }
-                        self.add_job_if_new(job_data, jobs)
-                
-                time.sleep(1)  # Rate limiting
-            
-            print(f"Adzuna: Found {len(jobs)} new jobs")
-        except Exception as e:
-            print(f"Error searching Adzuna: {e}")
-        return jobs
-    
-    def search_himalayas(self, keywords):
-        """Scrape Himalayas.app"""
-        jobs = []
-        try:
-            print("Searching Himalayas...")
-            response = requests.get("https://himalayas.app/jobs", headers=self.headers, timeout=15)
-            
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.content, 'html.parser')
-                job_items = soup.find_all(['div', 'article'], class_=re.compile(r'job'))
-                
-                for item in job_items[:30]:
-                    try:
-                        title_elem = item.find(['h2', 'h3', 'a'])
-                        if title_elem:
-                            title = title_elem.get_text(strip=True)
-                            
-                            if self.matches_keywords(title, keywords):
-                                link = item.find('a', href=True)
-                                company_elem = item.find(class_=re.compile(r'company'))
-                                
-                                job_data = {
-                                    'title': title,
-                                    'company': company_elem.get_text(strip=True) if company_elem else 'Various',
-                                    'location': 'Remote',
-                                    'url': urljoin("https://himalayas.app", link['href']) if link else '',
-                                    'posted': 'Recent',
-                                    'source': 'Himalayas'
-                                }
-                                self.add_job_if_new(job_data, jobs)
-                    except:
-                        continue
-                
-                print(f"Himalayas: Found {len(jobs)} new jobs")
-        except Exception as e:
-            print(f"Error scraping Himalayas: {e}")
-        return jobs
-    
-    def search_flexjobs(self, keywords):
-        """Scrape FlexJobs public listings"""
-        jobs = []
-        try:
-            print("Searching FlexJobs...")
-            # Note: FlexJobs is mostly paywalled, but some public listings exist
-            response = requests.get("https://www.flexjobs.com/search", headers=self.headers, timeout=15)
-            
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.content, 'html.parser')
-                job_cards = soup.find_all(['div', 'article'], class_=re.compile(r'job'))
-                
-                for card in job_cards[:20]:
-                    try:
-                        title_elem = card.find(['h2', 'h3', 'h4', 'a'])
-                        if title_elem:
-                            title = title_elem.get_text(strip=True)
-                            
-                            if self.matches_keywords(title, keywords):
-                                link = card.find('a', href=True)
-                                company_elem = card.find(class_=re.compile(r'company'))
-                                
-                                job_data = {
-                                    'title': title,
-                                    'company': company_elem.get_text(strip=True) if company_elem else 'Various',
-                                    'location': 'Remote',
-                                    'url': urljoin("https://www.flexjobs.com", link['href']) if link else '',
-                                    'posted': 'Recent',
-                                    'source': 'FlexJobs'
-                                }
-                                self.add_job_if_new(job_data, jobs)
-                    except:
-                        continue
-                
-                print(f"FlexJobs: Found {len(jobs)} new jobs")
-        except Exception as e:
-            print(f"Error scraping FlexJobs: {e}")
-        return jobs
-    
-    # ========== OPTIONAL SITES (may have issues) ==========
-    
-    def search_remoterocketship(self, keywords):
-        """Scrape Remote Rocketship"""
-        jobs = []
-        try:
-            print("Searching RemoteRocketship...")
-            response = requests.get("https://www.remoterocketship.com/", headers=self.headers, timeout=15)
-            
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.content, 'html.parser')
-                job_cards = soup.find_all('a', href=re.compile(r'/jobs/'))
-                
-                for card in job_cards[:20]:
-                    try:
-                        title = card.get_text(strip=True)
-                        url = urljoin("https://www.remoterocketship.com", card['href'])
+                        job_id = self.generate_job_id(title, company, job_url)
                         
-                        if self.matches_keywords(title, keywords):
-                            job_data = {
-                                'title': title,
-                                'company': 'Various',
-                                'location': 'Remote',
-                                'url': url,
-                                'posted': 'Recent',
-                                'source': 'RemoteRocketship'
-                            }
-                            self.add_job_if_new(job_data, jobs)
-                    except:
-                        continue
-                
-                print(f"RemoteRocketship: Found {len(jobs)} new jobs")
-        except Exception as e:
-            print(f"Error scraping RemoteRocketship: {e}")
-        return jobs
-    
-    def search_workinstartups(self, keywords):
-        """Scrape Work in Startups"""
-        jobs = []
-        try:
-            print("Searching WorkInStartups...")
-            response = requests.get("https://workinstartups.com/job-board/", headers=self.headers, timeout=15)
+                        if self.is_new_job(job_id) and self.matches_keywords(job):
+                            job['id'] = job_id
+                            jobs.append(job)
+                            self.mark_as_seen(job_id)
+                    
+                    await asyncio.sleep(0.1)
             
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.content, 'html.parser')
-                job_listings = soup.find_all('div', class_=re.compile(r'job'))
-                
-                for job in job_listings[:20]:
-                    try:
-                        title_elem = job.find(['h3', 'h2', 'a'])
-                        if title_elem:
-                            title = title_elem.get_text(strip=True)
-                            
-                            if self.matches_keywords(title, keywords):
-                                link = job.find('a', href=True)
-                                url = urljoin("https://workinstartups.com", link['href']) if link else ''
-                                
-                                job_data = {
-                                    'title': title,
-                                    'company': 'Startup',
-                                    'location': 'Various',
-                                    'url': url,
-                                    'posted': 'Recent',
-                                    'source': 'WorkInStartups'
-                                }
-                                self.add_job_if_new(job_data, jobs)
-                    except:
-                        continue
-                
-                print(f"WorkInStartups: Found {len(jobs)} new jobs")
+            health_tracker.record_success(site_name, len(jobs))
+            logger.info(f"{site_name}: Found {len(jobs)} new jobs from {total_queries} queries")
         except Exception as e:
-            print(f"Error scraping WorkInStartups: {e}")
+            health_tracker.record_failure(site_name, str(e))
+            logger.error(f"{site_name} error: {e}")
+        
         return jobs
+
+    # ============= GENERIC HTML SCRAPER (Config-driven) =============
+    def _find_element(self, container, selector: str, fallback_selector: str = None):
+        """Find element using CSS selector with fallback support."""
+        if selector == "self":
+            return container
+        
+        elem = container.select_one(selector)
+        if not elem and fallback_selector:
+            elem = container.select_one(fallback_selector)
+        return elem
     
-    def search_hiringcafe(self, keywords):
-        """Scrape Hiring Cafe"""
+    def _extract_text(self, elem) -> str:
+        """Extract text from element safely."""
+        if elem is None:
+            return ''
+        return elem.get_text(strip=True)
+    
+    def _extract_url(self, elem, base_url: str) -> str:
+        """Extract URL from element safely."""
+        if elem is None:
+            return ''
+        href = elem.get('href', '')
+        if href:
+            return urljoin(base_url, href)
+        return ''
+
+    async def scrape_html_site(self, site_key: str, site_config: dict) -> list[dict]:
+        """Generic HTML scraper that uses YAML config for selectors."""
         jobs = []
+        site_name = site_config.get('name', site_key)
+        url = site_config.get('url', '')
+        max_jobs = site_config.get('max_jobs', 20)
+        selectors = site_config.get('selectors', {})
+        fallback_selectors = site_config.get('fallback_selectors', {})
+        
+        if not url:
+            health_tracker.record_failure(site_name, "No URL configured")
+            return jobs
+        
         try:
-            print("Searching HiringCafe...")
-            response = requests.get("https://hiring.cafe/", headers=self.headers, timeout=15)
+            html = await http_client.fetch(url)
+            if not html:
+                health_tracker.record_failure(site_name, "Failed to fetch")
+                return jobs
             
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.content, 'html.parser')
-                job_items = soup.find_all(['div', 'article'], class_=re.compile(r'job', re.I))
+            soup = self.parse_html(html)
+            base_url = url.rsplit('/', 1)[0] if '/' in url else url
+            
+            job_selector = selectors.get('job_container', '')
+            fallback_job_selector = fallback_selectors.get('job_container', '')
+            
+            job_containers = soup.select(job_selector)[:max_jobs] if job_selector else []
+            if not job_containers and fallback_job_selector:
+                job_containers = soup.select(fallback_job_selector)[:max_jobs]
+            
+            if not job_containers:
+                health_tracker.record_failure(site_name, "No job containers found")
+                return jobs
+            
+            seen_urls = set()
+            
+            for container in job_containers:
+                title_selector = selectors.get('title', '')
+                fallback_title = fallback_selectors.get('title', '')
+                title_elem = self._find_element(container, title_selector, fallback_title)
                 
-                for item in job_items[:20]:
-                    try:
-                        title_elem = item.find(['h2', 'h3', 'a'])
-                        if title_elem:
-                            title = title_elem.get_text(strip=True)
-                            
-                            if self.matches_keywords(title, keywords):
-                                link = item.find('a', href=True)
-                                url = link['href'] if link else ''
-                                
-                                job_data = {
-                                    'title': title,
-                                    'company': 'Various',
-                                    'location': 'Remote',
-                                    'url': url if url.startswith('http') else urljoin("https://hiring.cafe", url),
-                                    'posted': 'Recent',
-                                    'source': 'HiringCafe'
-                                }
-                                self.add_job_if_new(job_data, jobs)
-                    except:
-                        continue
+                if title_selector == "self":
+                    title = self._extract_text(container)
+                    job_url = self._extract_url(container, base_url)
+                else:
+                    title = self._extract_text(title_elem)
+                    
+                    link_selector = selectors.get('link', 'a')
+                    fallback_link = fallback_selectors.get('link', '')
+                    link_elem = self._find_element(container, link_selector, fallback_link)
+                    job_url = self._extract_url(link_elem, base_url)
                 
-                print(f"HiringCafe: Found {len(jobs)} new jobs")
+                if not title or len(title) < 3 or not job_url:
+                    continue
+                
+                if job_url in seen_urls:
+                    continue
+                seen_urls.add(job_url)
+                
+                company_selector = selectors.get('company', '')
+                fallback_company = fallback_selectors.get('company', '')
+                company_elem = self._find_element(container, company_selector, fallback_company) if company_selector else None
+                company = self._extract_text(company_elem)
+                
+                job = {'title': title, 'company': company, 'url': job_url, 'source': site_name}
+                job_id = self.generate_job_id(title, company, job_url)
+                
+                if self.is_new_job(job_id) and self.matches_keywords(job):
+                    job['id'] = job_id
+                    jobs.append(job)
+                    self.mark_as_seen(job_id)
+            
+            health_tracker.record_success(site_name, len(jobs))
+            logger.info(f"{site_name}: Found {len(jobs)} new matching jobs")
         except Exception as e:
-            print(f"Error scraping HiringCafe: {e}")
+            health_tracker.record_failure(site_name, str(e))
+            logger.error(f"{site_name} error: {e}")
+        
         return jobs
-    
-    def search_all_sites(self, keywords):
-        """Search all configured job sites"""
+
+    async def scrape_all_html_sites(self) -> list[list[dict]]:
+        """Scrape all HTML sites from YAML config concurrently."""
+        sites_config = CONFIG.get('sites', {})
+        tasks = []
+        
+        for site_key, site_config in sites_config.items():
+            if not site_config.get('enabled', True):
+                continue
+            if site_config.get('type') != 'html':
+                continue
+            
+            tasks.append(self.scrape_html_site(site_key, site_config))
+        
+        return await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def scrape_all_sites(self) -> list[dict]:
+        logger.info(f"Starting concurrent scrape with keywords: {SEARCH_KEYWORDS}")
+        
+        api_tasks = [
+            self.scrape_remoteok_api(),
+            self.scrape_remotive_api(),
+            self.scrape_adzuna(),
+            self.scrape_google_search(),
+        ]
+        
+        html_task = self.scrape_all_html_sites()
+        
+        all_results = await asyncio.gather(*api_tasks, html_task, return_exceptions=True)
+        
         all_jobs = []
+        for result in all_results:
+            if isinstance(result, Exception):
+                logger.error(f"Task failed: {result}")
+            elif isinstance(result, list):
+                for item in result:
+                    if isinstance(item, Exception):
+                        logger.error(f"HTML scraper failed: {item}")
+                    elif isinstance(item, list):
+                        all_jobs.extend(item)
+                    elif isinstance(item, dict):
+                        all_jobs.append(item)
         
-        print("🔍 Searching primary job sites...\n")
-        
-        # Original reliable sites
-        all_jobs.extend(self.search_remoteok(keywords))
-        time.sleep(1)
-        all_jobs.extend(self.search_remoteok_devjobs(keywords))
-        time.sleep(1)
-        all_jobs.extend(self.search_weworkremotely(keywords))
-        time.sleep(1)
-        all_jobs.extend(self.search_remotive(keywords))
-        time.sleep(1)
-        
-        # Web3/Crypto sites
-        print("\n🌐 Searching Web3/Crypto sites...\n")
-        all_jobs.extend(self.search_bitcoinerjobs(keywords))
-        time.sleep(1)
-        all_jobs.extend(self.search_web3career(keywords))
-        time.sleep(1)
-        all_jobs.extend(self.search_remote3(keywords))
-        time.sleep(1)
-        all_jobs.extend(self.search_protocolai(keywords))
-        time.sleep(1)
-        all_jobs.extend(self.search_cryptocurrencyjobs(keywords))
-        time.sleep(1)
-        all_jobs.extend(self.search_laborx(keywords))
-        time.sleep(1)
-        
-        # General remote sites
-        print("\n🏠 Searching general remote sites...\n")
-        all_jobs.extend(self.search_dailyremote(keywords))
-        time.sleep(1)
-        all_jobs.extend(self.search_justremote(keywords))
-        time.sleep(1)
-        all_jobs.extend(self.search_workingnomads(keywords))
-        time.sleep(1)
-        all_jobs.extend(self.search_remoteco(keywords))
-        time.sleep(1)
-        
-        # NEW sites
-        print("\n✨ Searching NEW sites...\n")
-        all_jobs.extend(self.search_wellfound(keywords))
-        time.sleep(1)
-        all_jobs.extend(self.search_adzuna(keywords))
-        time.sleep(1)
-        all_jobs.extend(self.search_himalayas(keywords))
-        time.sleep(1)
-        all_jobs.extend(self.search_flexjobs(keywords))
-        time.sleep(1)
-        
-        # Optional sites (may have issues)
-        print("\n⚠️  Checking optional sites...\n")
-        try:
-            all_jobs.extend(self.search_remoterocketship(keywords))
-            time.sleep(1)
-        except:
-            print("RemoteRocketship: Skipped")
-        
-        try:
-            all_jobs.extend(self.search_workinstartups(keywords))
-            time.sleep(1)
-        except:
-            print("WorkInStartups: Skipped")
-        
-        try:
-            all_jobs.extend(self.search_hiringcafe(keywords))
-            time.sleep(1)
-        except:
-            print("HiringCafe: Skipped")
-        
-        self.save_seen_jobs()
+        logger.info(f"Total new matching jobs: {len(all_jobs)}")
+        logger.info(health_tracker.get_summary())
         return all_jobs
 
-# ============= NOTIFICATION HANDLERS =============
-
-def send_telegram_notification(jobs):
-    """Send notification via Telegram"""
-    if not jobs or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+# ============= TELEGRAM NOTIFICATION =============
+async def send_telegram_notification(jobs: list[dict]) -> bool:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.warning("Telegram credentials not configured")
         return False
     
-    try:
-        # Split into chunks if too many jobs
-        chunk_size = 10
-        for i in range(0, len(jobs), chunk_size):
-            chunk = jobs[i:i+chunk_size]
-            
-            message = f"🔔 *Found {len(chunk)} New Job(s)!*"
-            if i > 0:
-                message += f" (Part {i//chunk_size + 1})"
-            message += "\n\n"
-            
-            for j, job in enumerate(chunk, 1):
-                message += f"*{i+j}. {job['title']}*\n"
-                message += f"🏢 {job['company']}\n"
-                message += f"📍 {job['location']}\n"
-                message += f"🔗 {job['url']}\n"
-                message += f"📅 {job['posted']}\n"
-                message += f"📱 {job['source']}\n\n"
-            
-            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-            data = {
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": message,
-                "parse_mode": "Markdown",
-                "disable_web_page_preview": True
-            }
-            
-            response = requests.post(url, data=data, timeout=10)
-            if response.status_code != 200:
-                print(f"✗ Telegram notification failed: {response.text}")
-                return False
-            
-            time.sleep(1)  # Avoid rate limiting
-        
-        print(f"✓ Telegram notification sent ({len(jobs)} jobs)")
+    if not jobs:
+        logger.info("No new jobs to notify")
         return True
-    except Exception as e:
-        print(f"Error sending Telegram notification: {e}")
-        return False
-
-def send_email_notification(jobs):
-    """Send notification via Email"""
-    if not jobs or not EMAIL_SENDER or not EMAIL_PASSWORD:
-        return False
     
     try:
-        import smtplib
-        from email.mime.text import MIMEText
-        from email.mime.multipart import MIMEMultipart
+        session = await http_client.get_session()
         
-        msg = MIMEMultipart('alternative')
-        msg['Subject'] = f"🔔 {len(jobs)} New Job Opportunities"
-        msg['From'] = EMAIL_SENDER
-        msg['To'] = EMAIL_RECIPIENT or EMAIL_SENDER
+        header = f"🔔 *{len(jobs)} New Job(s) Found!*\n"
+        header += f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+        header += f"🔍 Keywords: {', '.join(SEARCH_KEYWORDS[:3])}\n"
+        header += "─" * 30 + "\n\n"
         
-        html = f"""
-        <html>
-          <head>
-            <style>
-              body {{ font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }}
-              h2 {{ color: #333; }}
-              .job {{ margin: 20px 0; padding: 15px; border: 1px solid #ddd; 
-                      border-radius: 5px; background: #f9f9f9; }}
-              .job h3 {{ margin: 0 0 10px 0; color: #2c5282; }}
-              .job p {{ margin: 5px 0; color: #555; }}
-              .job .label {{ font-weight: bold; color: #333; }}
-              .button {{ background: #3182ce; color: white !important; padding: 10px 20px; 
-                        text-decoration: none; border-radius: 5px; display: inline-block; 
-                        margin-top: 10px; }}
-              .button:hover {{ background: #2c5282; }}
-              .source {{ background: #edf2f7; padding: 5px 10px; border-radius: 3px; 
-                        display: inline-block; font-size: 12px; color: #4a5568; }}
-            </style>
-          </head>
-          <body>
-            <h2>🔔 {len(jobs)} New Job Opportunities Found!</h2>
-            <p style="color: #666;">Found across {len(set(j['source'] for j in jobs))} job sites</p>
-        """
+        messages = [header]
+        current_message = header
         
         for i, job in enumerate(jobs, 1):
-            html += f"""
-            <div class="job">
-                <h3>{i}. {job['title']}</h3>
-                <p><span class="label">Company:</span> {job['company']}</p>
-                <p><span class="label">Location:</span> {job['location']}</p>
-                <p><span class="label">Posted:</span> {job['posted']}</p>
-                <p><span class="source">Source: {job['source']}</span></p>
-                <a href="{job['url']}" class="button">View Job Details</a>
-            </div>
-            """
+            title = job.get('title', 'Unknown')[:100]
+            company = job.get('company', 'Unknown')[:50]
+            url = job.get('url', '')
+            source = job.get('source', 'Unknown')
+            
+            job_text = f"*{i}. {title}*\n"
+            job_text += f"🏢 {company}\n" if company else ""
+            job_text += f"🌐 {source}\n"
+            job_text += f"🔗 [Apply Here]({url})\n\n"
+            
+            if len(current_message) + len(job_text) > 4000:
+                messages.append(current_message)
+                current_message = job_text
+            else:
+                current_message += job_text
         
-        html += """
-            <hr style="margin: 30px 0; border: none; border-top: 1px solid #ddd;">
-            <p style="color: #999; font-size: 12px; text-align: center;">
-              This is an automated job alert. Jobs are checked hourly.
-            </p>
-          </body>
-        </html>
-        """
+        if current_message and current_message != header:
+            messages.append(current_message)
         
-        msg.attach(MIMEText(html, 'html'))
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         
-        with smtplib.SMTP('smtp.gmail.com', 587) as server:
-            server.starttls()
-            server.login(EMAIL_SENDER, EMAIL_PASSWORD)
-            server.send_message(msg)
+        for msg in messages:
+            payload = {
+                'chat_id': TELEGRAM_CHAT_ID,
+                'text': msg,
+                'parse_mode': 'Markdown',
+                'disable_web_page_preview': True
+            }
+            
+            async with session.post(url, json=payload) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    logger.error(f"Telegram API error: {error_text}")
+                    return False
+            
+            await asyncio.sleep(0.5)
         
-        print(f"✓ Email notification sent ({len(jobs)} jobs)")
+        logger.info(f"Successfully sent {len(messages)} Telegram message(s)")
         return True
     except Exception as e:
-        print(f"Error sending email notification: {e}")
+        logger.error(f"Error sending Telegram notification: {e}")
         return False
 
-# ============= MAIN FUNCTION =============
+# ============= CLI ARGUMENT PARSING =============
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description='Job Monitor Bot - Scrapes job sites and sends Telegram notifications'
+    )
+    parser.add_argument(
+        '--dry-run',
+        action='store_true',
+        help='Test mode: scrape sites but skip Telegram notifications and seen_jobs.json updates. Prints detailed report of working/failed sites.'
+    )
+    parser.add_argument(
+        '--google-only',
+        action='store_true',
+        help='Only run Google Custom Search scraper (useful for testing Google API setup)'
+    )
+    parser.add_argument(
+        '--adzuna-only',
+        action='store_true',
+        help='Only run Adzuna API scraper (useful for testing Adzuna API setup)'
+    )
+    return parser.parse_args()
 
-def main():
-    """Main function to run the job search"""
-    print("="*80)
-    print("JOB MONITORING BOT - GitHub Actions Edition")
-    print("Now monitoring 23+ job sites including Wellfound, Adzuna, Himalayas & more!")
-    print("="*80)
-    print(f"🕐 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}")
-    print(f"🔍 Keywords: {', '.join(SEARCH_KEYWORDS)}")
-    print(f"📬 Notification: {NOTIFICATION_METHOD}")
-    print("="*80)
-    print()
+def print_dry_run_report(jobs: list[dict]):
+    """Print detailed report for dry-run mode."""
+    print("\n" + "=" * 60)
+    print("DRY RUN REPORT")
+    print("=" * 60)
     
-    # Initialize scraper
+    # Working sites
+    working = health_tracker.get_working_sites()
+    print(f"\n✅ WORKING SITES ({len(working)}):")
+    print("-" * 40)
+    if working:
+        for site in working:
+            print(f"  ✓ {site['site']}: {site['jobs_found']} jobs found")
+    else:
+        print("  No working sites found")
+    
+    # Failed sites
+    failed = health_tracker.get_failed_sites()
+    print(f"\n❌ FAILED SITES ({len(failed)}):")
+    print("-" * 40)
+    if failed:
+        for site in failed:
+            print(f"  ✗ {site['site']}")
+            print(f"    Reason: {site['error']}")
+            print(f"    Failures: {site['failures']}")
+            print()
+    else:
+        print("  All sites working!")
+    
+    # Jobs found
+    print(f"\n📋 JOBS FOUND ({len(jobs)}):")
+    print("-" * 40)
+    if jobs:
+        for i, job in enumerate(jobs[:20], 1):  # Show first 20
+            title = job.get('title', 'Unknown')[:60]
+            company = job.get('company', 'Unknown')[:30]
+            source = job.get('source', 'Unknown')
+            print(f"  {i}. [{source}] {title}")
+            print(f"     Company: {company}")
+        if len(jobs) > 20:
+            print(f"\n  ... and {len(jobs) - 20} more jobs")
+    else:
+        print("  No matching jobs found")
+    
+    print("\n" + "=" * 60)
+    print("END OF DRY RUN REPORT")
+    print("=" * 60 + "\n")
+
+# ============= MAIN =============
+async def main(dry_run: bool = False, google_only: bool = False, adzuna_only: bool = False):
+    logger.info("=" * 50)
+    logger.info("Job Monitor Bot Starting")
+    if dry_run:
+        logger.info("🧪 DRY RUN MODE - No notifications, no seen_jobs.json updates")
+    if google_only:
+        logger.info("🔍 GOOGLE ONLY MODE - Only running Google Custom Search")
+    if adzuna_only:
+        logger.info("💼 ADZUNA ONLY MODE - Only running Adzuna API")
+    logger.info(f"Search keywords: {SEARCH_KEYWORDS}")
+    logger.info(f"Concurrent limit: {CONCURRENT_LIMIT}")
+    logger.info("=" * 50)
+    
     scraper = JobSiteScraper()
     
-    # Search for jobs
-    print("Starting comprehensive job search across 23+ sites...\n")
-    new_jobs = scraper.search_all_sites(SEARCH_KEYWORDS)
-    
-    print("\n" + "="*80)
-    if new_jobs:
-        print(f"✅ SUCCESS! FOUND {len(new_jobs)} NEW JOB(S)!")
-        print("="*80)
-        
-        # Group by source
-        by_source = {}
-        for job in new_jobs:
-            source = job['source']
-            by_source[source] = by_source.get(source, 0) + 1
-        
-        print("\n📊 Jobs by Source:")
-        for source, count in sorted(by_source.items(), key=lambda x: x[1], reverse=True):
-            print(f"   • {source}: {count} job(s)")
-        
-        print("\n📋 Job Listings:")
-        for i, job in enumerate(new_jobs, 1):
-            print(f"{i}. {job['title']}")
-            print(f"   Company: {job['company']} | Source: {job['source']}")
-            print(f"   {job['url']}\n")
-        
-        # Send notifications
-        print("="*80)
-        print("Sending notifications...")
-        if NOTIFICATION_METHOD.lower() == 'telegram':
-            send_telegram_notification(new_jobs)
-        elif NOTIFICATION_METHOD.lower() == 'email':
-            send_email_notification(new_jobs)
+    try:
+        start_time = datetime.now()
+        if google_only:
+            new_jobs = await scraper.scrape_google_search()
+        elif adzuna_only:
+            new_jobs = await scraper.scrape_adzuna()
         else:
-            print("⚠️  No valid notification method configured")
-    else:
-        print("ℹ️  No new jobs found this time.")
-        print("="*80)
-        print("\n💡 Tips:")
-        print("   • Jobs may already be in your seen list")
-        print("   • Try broader keywords if results are limited")
-        print("   • Check back in an hour for new postings")
+            new_jobs = await scraper.scrape_all_sites()
+        elapsed = (datetime.now() - start_time).total_seconds()
+        
+        logger.info(f"Scraping completed in {elapsed:.2f} seconds")
+        
+        if dry_run:
+            print_dry_run_report(new_jobs)
+        else:
+            if new_jobs:
+                logger.info(f"Found {len(new_jobs)} new matching jobs")
+                await send_telegram_notification(new_jobs)
+            else:
+                logger.info("No new matching jobs found")
+            
+            scraper.save_seen_jobs()
+        
+    except Exception as e:
+        logger.error(f"Error in main: {e}")
+        raise
+    finally:
+        await http_client.close()
     
-    print("\n" + "="*80)
-    print("✅ Job search completed successfully!")
-    print(f"📝 Tracking {len(scraper.seen_jobs)} total seen jobs")
-    print("="*80)
+    logger.info("Job Monitor Bot Finished")
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    asyncio.run(main(dry_run=args.dry_run, google_only=args.google_only, adzuna_only=args.adzuna_only))
