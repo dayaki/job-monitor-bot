@@ -351,12 +351,13 @@ class JobSiteScraper:
                         title = item.get('title', '')
                         company = item.get('company', {}).get('display_name', '')
                         job_url = item.get('redirect_url', '')
+                        adzuna_id = item.get('id', '')
                         
                         if not title or not job_url:
                             continue
                         
                         job = {'title': title, 'company': company, 'url': job_url, 'source': site_name}
-                        job_id = self.generate_job_id(title, company, job_url)
+                        job_id = f"adzuna_{adzuna_id}" if adzuna_id else self.generate_job_id(title, company, job_url)
                         if self.is_new_job(job_id) and self.matches_keywords(job):
                             job['id'] = job_id
                             jobs.append(job)
