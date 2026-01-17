@@ -51,9 +51,6 @@ sites:
   - domain: "jobs.workable.com"
     name: "Workable"
 
-  - domain: "remoterocketship.com"
-    name: "Remote Rocketship"
-
   - domain: "wellfound.com"
     name: "Wellfound"
 

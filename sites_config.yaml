@@ -3,30 +3,6 @@
 
 sites:
   # ========== PRIMARY REMOTE SITES ==========
-  remoteok_api:
-    name: "RemoteOK"
-    url: "https://remoteok.com/api"
-    type: "api"
-    enabled: true
-    max_jobs: 50
-
-  remoteok_dev:
-    name: "RemoteOK-Dev"
-    url: "https://remoteok.com/remote-dev-jobs"
-    type: "html"
-    enabled: true
-    max_jobs: 30
-    selectors:
-      job_container: "tr.job"
-      title: "h2[itemprop='title']"
-      company: "h3[itemprop='name']"
-      link: "a[itemprop='url']"
-    fallback_selectors:
-      job_container: "tr[data-slug]"
-      title: ".title, h2"
-      company: ".company, h3"
-      link: "a[href*='/remote-jobs/']"
-
   weworkremotely:
     name: "WeWorkRemotely"
     url: "https://weworkremotely.com/categories/remote-programming-jobs"
@@ -209,7 +185,6 @@ sites:
       company: ".company"
       link: "a[href*='/job/']"
 
-  # ========== STARTUP/TECH SITES ==========
   wellfound:
     name: "Wellfound"
     url: "https://wellfound.com/jobs"
@@ -227,54 +202,6 @@ sites:
       company: "[class*='companyName']"
       link: "a[href*='/jobs/']"
 
-  himalayas:
-    name: "Himalayas"
-    url: "https://himalayas.app/jobs"
-    type: "html"
-    enabled: true
-    max_jobs: 30
-    selectors:
-      job_container: "div[class*='job'], article[class*='job']"
-      title: "h2, h3, a"
-      company: "[class*='company']"
-      link: "a"
-    fallback_selectors:
-      job_container: "[data-job-id]"
-      title: ".job-title"
-      company: ".company-name"
-      link: "a[href*='/jobs/']"
-
-  flexjobs:
-    name: "FlexJobs"
-    url: "https://www.flexjobs.com/search"
-    type: "html"
-    enabled: true
-    max_jobs: 20
-    selectors:
-      job_container: "div[class*='job'], article[class*='job']"
-      title: "h2, h3, h4, a"
-      company: "[class*='company']"
-      link: "a"
-    fallback_selectors:
-      job_container: ".job-tile"
-      title: ".job-title"
-      company: ".company"
-      link: "a[href*='/job/']"
-
-  # ========== OPTIONAL SITES ==========
-  remoterocketship:
-    name: "RemoteRocketship"
-    url: "https://www.remoterocketship.com/"
-    type: "html"
-    enabled: true
-    max_jobs: 20
-    selectors:
-      job_container: "a[href*='/jobs/']"
-      title: "self"
-    fallback_selectors:
-      job_container: ".job-link"
-      title: "self"
-
   workinstartups:
     name: "WorkInStartups"
     url: "https://workinstartups.com/job-board/"
@@ -289,33 +216,3 @@ sites:
       job_container: ".job-listing"
       title: ".job-title"
       link: "a[href*='/job/']"
-
-  hiringcafe:
-    name: "HiringCafe"
-    url: "https://hiring.cafe/"
-    type: "html"
-    enabled: true
-    max_jobs: 20
-    selectors:
-      job_container: "div[class*='job'], article[class*='job']"
-      title: "h2, h3, a"
-      link: "a"
-    fallback_selectors:
-      job_container: ".job-card"
-      title: ".title"
-      link: "a[href*='/job']"
-
-# Adzuna API (requires credentials)
-adzuna:
-  enabled: true
-  countries: ["us"]
-  results_per_page: 20
-  max_keywords: 3
-
-# Request settings
-request:
-  timeout: 15
-  max_retries: 3
-  retry_base_delay: 1.0
-  retry_max_delay: 10.0
-  concurrent_limit: 10
