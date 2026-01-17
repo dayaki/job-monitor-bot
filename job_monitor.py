@@ -244,132 +244,6 @@ class JobSiteScraper:
         except Exception:
             return BeautifulSoup(html, 'html.parser')
 
-    # ============= API SCRAPERS (Custom - unique response structures) =============
-    async def scrape_remoteok_api(self) -> list[dict]:
-        jobs = []
-        site_name = "RemoteOK-API"
-        try:
-            data = await http_client.fetch("https://remoteok.com/api", return_json=True)
-            if not data or not isinstance(data, list):
-                health_tracker.record_failure(site_name, "Invalid response")
-                return jobs
-            
-            for item in data[1:51]:
-                if not isinstance(item, dict):
-                    continue
-                title = item.get('position', '')
-                company = item.get('company', '')
-                url = item.get('url', '')
-                
-                if not title or not url:
-                    continue
-                
-                job = {'title': title, 'company': company, 'url': url, 'source': site_name, 'description': item.get('description', '')}
-                job_id = self.generate_job_id(title, company, url)
-                if self.is_new_job(job_id) and self.matches_keywords(job):
-                    job['id'] = job_id
-                    jobs.append(job)
-                    self.mark_as_seen(job_id)
-            
-            health_tracker.record_success(site_name, len(jobs))
-            logger.info(f"{site_name}: Found {len(jobs)} new matching jobs")
-        except Exception as e:
-            health_tracker.record_failure(site_name, str(e))
-            logger.error(f"{site_name} error: {e}")
-        return jobs
-
-    async def scrape_remotive_api(self) -> list[dict]:
-        jobs = []
-        site_name = "Remotive"
-        try:
-            data = await http_client.fetch("https://remotive.com/api/remote-jobs?category=software-dev", return_json=True)
-            if not data or 'jobs' not in data:
-                health_tracker.record_failure(site_name, "Invalid response")
-                return jobs
-            
-            for item in data['jobs'][:30]:
-                title = item.get('title', '')
-                company = item.get('company_name', '')
-                url = item.get('url', '')
-                
-                if not title or not url:
-                    continue
-                
-                job = {'title': title, 'company': company, 'url': url, 'source': site_name, 'description': item.get('description', '')}
-                job_id = self.generate_job_id(title, company, url)
-                if self.is_new_job(job_id) and self.matches_keywords(job):
-                    job['id'] = job_id
-                    jobs.append(job)
-                    self.mark_as_seen(job_id)
-            
-            health_tracker.record_success(site_name, len(jobs))
-            logger.info(f"{site_name}: Found {len(jobs)} new matching jobs")
-        except Exception as e:
-            health_tracker.record_failure(site_name, str(e))
-            logger.error(f"{site_name} error: {e}")
-        return jobs
-
-    async def scrape_adzuna(self) -> list[dict]:
-        jobs = []
-        site_name = "Adzuna"
-        
-        if not ADZUNA_APP_ID or not ADZUNA_APP_KEY:
-            logger.debug(f"{site_name}: Skipped (no credentials)")
-            return jobs
-        
-        try:
-            adzuna_config = CONFIG.get('adzuna', {})
-            countries = adzuna_config.get('countries', ['us'])
-            results_per_page = adzuna_config.get('results_per_page', 20)
-            
-            for country in countries:
-                for keyword in SEARCH_KEYWORDS[:3]:
-                    encoded_keyword = quote_plus(keyword)
-                    url = f"https://api.adzuna.com/v1/api/jobs/{country}/search/1?app_id={ADZUNA_APP_ID}&app_key={ADZUNA_APP_KEY}&results_per_page={results_per_page}&what={encoded_keyword}"
-                    
-                    data = await http_client.fetch(url, return_json=True)
-                    
-                    if data is None:
-                        logger.warning(f"{site_name}: No response for keyword '{keyword}' in {country}")
-                        continue
-                    
-                    if isinstance(data, str):
-                        logger.warning(f"{site_name}: Got HTML instead of JSON - check API credentials")
-                        health_tracker.record_failure(site_name, "Invalid API credentials or rate limited")
-                        return jobs
-                    
-                    if 'error' in data:
-                        error_msg = data.get('error', {}).get('message', str(data.get('error')))
-                        logger.warning(f"{site_name}: API error - {error_msg}")
-                        continue
-                    
-                    if 'results' not in data:
-                        logger.debug(f"{site_name}: No results for keyword '{keyword}'")
-                        continue
-                    
-                    for item in data['results']:
-                        title = item.get('title', '')
-                        company = item.get('company', {}).get('display_name', '')
-                        job_url = item.get('redirect_url', '')
-                        adzuna_id = item.get('id', '')
-                        
-                        if not title or not job_url:
-                            continue
-                        
-                        job = {'title': title, 'company': company, 'url': job_url, 'source': site_name}
-                        job_id = f"adzuna_{adzuna_id}" if adzuna_id else self.generate_job_id(title, company, job_url)
-                        if self.is_new_job(job_id) and self.matches_keywords(job):
-                            job['id'] = job_id
-                            jobs.append(job)
-                            self.mark_as_seen(job_id)
-            
-            health_tracker.record_success(site_name, len(jobs))
-            logger.info(f"{site_name}: Found {len(jobs)} new matching jobs")
-        except Exception as e:
-            health_tracker.record_failure(site_name, str(e))
-            logger.error(f"{site_name} error: {e}")
-        return jobs
-
     # ============= GOOGLE CUSTOM SEARCH API =============
     async def scrape_google_search(self) -> list[dict]:
         """Search for jobs using Google Custom Search API."""
@@ -597,9 +471,6 @@ class JobSiteScraper:
         logger.info(f"Starting concurrent scrape with keywords: {SEARCH_KEYWORDS}")
         
         api_tasks = [
-            self.scrape_remoteok_api(),
-            self.scrape_remotive_api(),
-            self.scrape_adzuna(),
             self.scrape_google_search(),
         ]
         
@@ -642,7 +513,7 @@ async def send_telegram_notification(jobs: list[dict]) -> bool:
         header += f"🔍 Keywords: {', '.join(SEARCH_KEYWORDS[:3])}\n"
         header += "─" * 30 + "\n\n"
         
-        messages = [header]
+        messages = []
         current_message = header
         
         for i, job in enumerate(jobs, 1):
@@ -658,11 +529,11 @@ async def send_telegram_notification(jobs: list[dict]) -> bool:
             
             if len(current_message) + len(job_text) > 4000:
                 messages.append(current_message)
-                current_message = job_text
+                current_message = header + job_text
             else:
                 current_message += job_text
         
-        if current_message and current_message != header:
+        if current_message:
             messages.append(current_message)
         
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -779,8 +650,6 @@ async def main(dry_run: bool = False, google_only: bool = False, adzuna_only: bo
         start_time = datetime.now()
         if google_only:
             new_jobs = await scraper.scrape_google_search()
-        elif adzuna_only:
-            new_jobs = await scraper.scrape_adzuna()
         else:
             new_jobs = await scraper.scrape_all_sites()
         elapsed = (datetime.now() - start_time).total_seconds()
