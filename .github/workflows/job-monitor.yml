@@ -47,7 +47,7 @@ jobs:
             echo "Found existing seen_jobs.json"
           else
             echo "No previous seen_jobs.json found, creating empty one"
-            echo "[]" > seen_jobs.json
+            echo "{}" > seen_jobs.json
           fi
 
       - name: Run job search
@@ -59,8 +59,6 @@ jobs:
           EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           EMAIL_RECIPIENT: ${{ secrets.EMAIL_RECIPIENT }}
-          ADZUNA_APP_ID: ${{ secrets.ADZUNA_APP_ID }}
-          ADZUNA_APP_KEY: ${{ secrets.ADZUNA_APP_KEY }}
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           GOOGLE_CSE_ID: ${{ secrets.GOOGLE_CSE_ID }}
         run: |

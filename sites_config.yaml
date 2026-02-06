@@ -20,13 +20,6 @@ sites:
       company: ".company"
       link: "a[href*='/remote-jobs/']"
 
-  remotive:
-    name: "Remotive"
-    url: "https://remotive.com/api/remote-jobs?category=software-dev"
-    type: "api"
-    enabled: true
-    max_jobs: 30
-
   # ========== WEB3/CRYPTO SITES ==========
   bitcoinerjobs:
     name: "BitcoinerJobs"

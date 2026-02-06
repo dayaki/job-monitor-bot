@@ -13,10 +13,11 @@ import logging
 import os
 import re
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
-from urllib.parse import urljoin, quote_plus
+from typing import Any, Optional
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import yaml
 from bs4 import BeautifulSoup
@@ -35,9 +36,6 @@ SEARCH_KEYWORDS = [kw.strip().lower() for kw in SEARCH_KEYWORDS]
 
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
-
-ADZUNA_APP_ID = os.getenv('ADZUNA_APP_ID', '')
-ADZUNA_APP_KEY = os.getenv('ADZUNA_APP_KEY', '')
 
 GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY', '')
 GOOGLE_CSE_ID = os.getenv('GOOGLE_CSE_ID', '')
@@ -75,6 +73,67 @@ MAX_RETRIES = REQUEST_CONFIG.get('max_retries', 3)
 RETRY_BASE_DELAY = REQUEST_CONFIG.get('retry_base_delay', 1.0)
 RETRY_MAX_DELAY = REQUEST_CONFIG.get('retry_max_delay', 10.0)
 CONCURRENT_LIMIT = REQUEST_CONFIG.get('concurrent_limit', 10)
+SEEN_JOBS_MAX = REQUEST_CONFIG.get('seen_jobs_max', 5000)
+SEEN_JOBS_TTL_DAYS = REQUEST_CONFIG.get('seen_jobs_ttl_days', 90)
+
+
+def normalize_job_url(url: str) -> str:
+    """Normalize URL by stripping fragment and tracking query parameters."""
+    if not url:
+        return ''
+    try:
+        parts = urlsplit(url.strip())
+        clean_query = []
+        for key, value in parse_qsl(parts.query, keep_blank_values=True):
+            lowered = key.lower()
+            if lowered.startswith('utm_') or lowered in {'ref', 'source', 'fbclid', 'gclid'}:
+                continue
+            clean_query.append((key, value))
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(clean_query), ''))
+    except Exception:
+        return url.strip()
+
+
+def clamp_google_date_restrict(raw_value: str) -> str:
+    """Force Google dateRestrict into a max 2-day window."""
+    if not raw_value:
+        return 'd1'
+    value = str(raw_value).strip().lower()
+    match = re.fullmatch(r'([dwm])(\d+)', value)
+    if not match:
+        return 'd1'
+    unit, count_str = match.groups()
+    count = int(count_str)
+    if unit == 'd':
+        return f'd{max(1, min(count, 2))}'
+    # Weeks/months are intentionally reduced to 2 days max.
+    return 'd2'
+
+
+class KeywordMatcher:
+    def __init__(self, keywords: list[str]):
+        self.keywords = [kw for kw in (kw.strip() for kw in keywords) if kw]
+        self.lower_keywords = [kw.lower() for kw in self.keywords]
+        self.patterns = [self._build_pattern(kw) for kw in self.keywords]
+
+    def _build_pattern(self, keyword: str) -> re.Pattern:
+        escaped = re.escape(keyword)
+        return re.compile(rf'(?<![A-Za-z0-9]){escaped}(?![A-Za-z0-9])', re.IGNORECASE)
+
+    def matches_title(self, title: str) -> bool:
+        if not self.patterns or not title:
+            return False
+        return any(pattern.search(title) for pattern in self.patterns)
+
+    def possibly_present_in_text(self, text: str) -> bool:
+        """Fast pre-check before parsing HTML."""
+        if not self.lower_keywords or not text:
+            return False
+        lowered = text.lower()
+        return any(keyword in lowered for keyword in self.lower_keywords)
+
+
+keyword_matcher = KeywordMatcher(SEARCH_KEYWORDS)
 
 # ============= SCRAPER HEALTH TRACKING =============
 class ScraperHealth:
@@ -136,6 +195,18 @@ class AsyncHTTPClient:
         }
         self._session: Optional[aiohttp.ClientSession] = None
         self._semaphore = asyncio.Semaphore(CONCURRENT_LIMIT)
+        self._cache_ttl_seconds = REQUEST_CONFIG.get('cache_ttl_seconds', 900)
+        self._cache_max_entries = REQUEST_CONFIG.get('cache_max_entries', 500)
+        self._persistent_cache_enabled = REQUEST_CONFIG.get('persistent_cache_enabled', False)
+        self._persistent_cache_file = REQUEST_CONFIG.get('persistent_cache_file', 'http_cache.json')
+        self._persistent_cache_value_limit = REQUEST_CONFIG.get('persistent_cache_value_limit', 100000)
+        self._response_cache: dict[str, dict[str, Any]] = {}
+        self._cache_lock = asyncio.Lock()
+        self._per_domain_min_interval = REQUEST_CONFIG.get('per_domain_min_interval', 0.2)
+        self._domain_last_request: dict[str, float] = {}
+        self._domain_backoff_until: dict[str, float] = {}
+        self._domain_locks: dict[str, asyncio.Lock] = {}
+        self._load_persistent_cache()
     
     async def get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -146,14 +217,105 @@ class AsyncHTTPClient:
     async def close(self):
         if self._session and not self._session.closed:
             await self._session.close()
+        self._save_persistent_cache()
+
+    def _load_persistent_cache(self):
+        if not self._persistent_cache_enabled:
+            return
+        try:
+            if not os.path.exists(self._persistent_cache_file):
+                return
+            with open(self._persistent_cache_file, 'r') as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return
+            now = time.time()
+            for key, entry in data.items():
+                ts = float(entry.get('ts', 0))
+                if now - ts <= self._cache_ttl_seconds:
+                    self._response_cache[key] = entry
+        except Exception as e:
+            logger.debug(f"Failed to load persistent cache: {e}")
+
+    def _save_persistent_cache(self):
+        if not self._persistent_cache_enabled:
+            return
+        try:
+            now = time.time()
+            compact: dict[str, dict[str, Any]] = {}
+            for key, entry in self._response_cache.items():
+                ts = float(entry.get('ts', 0))
+                if now - ts <= self._cache_ttl_seconds and entry.get('persistable', True):
+                    compact[key] = entry
+            with open(self._persistent_cache_file, 'w') as f:
+                json.dump(compact, f)
+        except Exception as e:
+            logger.debug(f"Failed to save persistent cache: {e}")
+
+    def _cache_key(self, url: str, return_json: bool) -> str:
+        return f"{url}|json={1 if return_json else 0}"
+
+    async def _get_cached(self, url: str, return_json: bool) -> Optional[str | dict]:
+        if self._cache_ttl_seconds <= 0:
+            return None
+        key = self._cache_key(url, return_json)
+        now = time.time()
+        async with self._cache_lock:
+            entry = self._response_cache.get(key)
+            if not entry:
+                return None
+            if now - float(entry.get('ts', 0)) > self._cache_ttl_seconds:
+                self._response_cache.pop(key, None)
+                return None
+            return entry.get('value')
+
+    async def _set_cached(self, url: str, return_json: bool, value: str | dict):
+        if self._cache_ttl_seconds <= 0:
+            return
+        persistable = not (
+            self._persistent_cache_enabled and
+            isinstance(value, str) and
+            len(value) > self._persistent_cache_value_limit
+        )
+        key = self._cache_key(url, return_json)
+        entry = {'ts': time.time(), 'value': value, 'persistable': persistable}
+        async with self._cache_lock:
+            self._response_cache[key] = entry
+            if len(self._response_cache) > self._cache_max_entries:
+                oldest_key = min(
+                    self._response_cache,
+                    key=lambda item_key: float(self._response_cache[item_key].get('ts', 0))
+                )
+                self._response_cache.pop(oldest_key, None)
+
+    async def _apply_domain_throttle(self, domain: str):
+        if not domain:
+            return
+        lock = self._domain_locks.setdefault(domain, asyncio.Lock())
+        async with lock:
+            now = time.time()
+            next_allowed = max(
+                self._domain_last_request.get(domain, 0) + self._per_domain_min_interval,
+                self._domain_backoff_until.get(domain, 0)
+            )
+            delay = next_allowed - now
+            if delay > 0:
+                await asyncio.sleep(delay)
+            self._domain_last_request[domain] = time.time()
     
     async def fetch(self, url: str, return_json: bool = False) -> Optional[str | dict]:
+        cached = await self._get_cached(url, return_json)
+        if cached is not None:
+            return cached
+
         async with self._semaphore:
             session = await self.get_session()
             last_error = None
+            domain = urlsplit(url).netloc.lower()
             
             for attempt in range(MAX_RETRIES):
                 try:
+                    await self._apply_domain_throttle(domain)
                     async with session.get(url) as response:
                         if response.status == 200:
                             if return_json:
@@ -162,15 +324,20 @@ class AsyncHTTPClient:
                                     logger.warning(f"Empty response from {url}")
                                     return None
                                 try:
-                                    return json.loads(text)
+                                    payload = json.loads(text)
+                                    await self._set_cached(url, return_json, payload)
+                                    return payload
                                 except json.JSONDecodeError as e:
                                     logger.warning(f"Invalid JSON response from {url}: {e}")
                                     logger.debug(f"Response content: {text[:500]}")
                                     return None
                             else:
-                                return await response.text()
+                                text = await response.text()
+                                await self._set_cached(url, return_json, text)
+                                return text
                         elif response.status == 429:
                             delay = min(RETRY_BASE_DELAY * (2 ** attempt), RETRY_MAX_DELAY)
+                            self._domain_backoff_until[domain] = time.time() + delay
                             logger.warning(f"Rate limited on {url}, waiting {delay}s")
                             await asyncio.sleep(delay)
                         elif response.status in (502, 503, 504):
@@ -206,37 +373,63 @@ class JobSiteScraper:
         self.seen_jobs_file = seen_jobs_file
         self.seen_jobs = self.load_seen_jobs()
     
-    def load_seen_jobs(self) -> set:
+    def load_seen_jobs(self) -> dict[str, float]:
         try:
             if os.path.exists(self.seen_jobs_file):
                 with open(self.seen_jobs_file, 'r') as f:
-                    return set(json.load(f))
-            return set()
+                    payload = json.load(f)
+                    now = time.time()
+                    if isinstance(payload, list):
+                        return {job_id: now for job_id in payload if isinstance(job_id, str)}
+                    if isinstance(payload, dict):
+                        seen: dict[str, float] = {}
+                        for job_id, ts in payload.items():
+                            if isinstance(job_id, str):
+                                try:
+                                    seen[job_id] = float(ts)
+                                except (TypeError, ValueError):
+                                    seen[job_id] = now
+                        return seen
+            return {}
         except Exception as e:
             logger.error(f"Error loading seen jobs: {e}")
-            return set()
+            return {}
     
     def save_seen_jobs(self):
         try:
+            self._prune_seen_jobs()
             with open(self.seen_jobs_file, 'w') as f:
-                json.dump(list(self.seen_jobs), f)
+                json.dump(self.seen_jobs, f)
             logger.info(f"Saved {len(self.seen_jobs)} seen jobs")
         except Exception as e:
             logger.error(f"Error saving seen jobs: {e}")
+
+    def _prune_seen_jobs(self):
+        if not self.seen_jobs:
+            return
+        now = time.time()
+        ttl_seconds = SEEN_JOBS_TTL_DAYS * 24 * 60 * 60
+        self.seen_jobs = {
+            job_id: ts
+            for job_id, ts in self.seen_jobs.items()
+            if now - ts <= ttl_seconds
+        }
+        if len(self.seen_jobs) > SEEN_JOBS_MAX:
+            newest_first = sorted(self.seen_jobs.items(), key=lambda item: item[1], reverse=True)
+            self.seen_jobs = dict(newest_first[:SEEN_JOBS_MAX])
     
     def generate_job_id(self, title: str, company: str, url: str) -> str:
-        unique_string = f"{title}|{company}|{url}".lower()
+        unique_string = f"{title}|{company}|{normalize_job_url(url)}".lower()
         return hashlib.md5(unique_string.encode()).hexdigest()
     
     def matches_keywords(self, job: dict) -> bool:
-        searchable = f"{job.get('title', '')} {job.get('company', '')} {job.get('description', '')}".lower()
-        return any(kw in searchable for kw in SEARCH_KEYWORDS)
+        return keyword_matcher.matches_title(job.get('title', ''))
     
     def is_new_job(self, job_id: str) -> bool:
         return job_id not in self.seen_jobs
     
     def mark_as_seen(self, job_id: str):
-        self.seen_jobs.add(job_id)
+        self.seen_jobs[job_id] = time.time()
     
     def parse_html(self, html: str) -> BeautifulSoup:
         try:
@@ -264,7 +457,7 @@ class JobSiteScraper:
         keywords = google_config.get('keywords', [])
         sites = google_config.get('sites', [])
         max_results = settings.get('max_results_per_query', 10)
-        date_restrict = settings.get('date_restrict', 'w1')
+        date_restrict = clamp_google_date_restrict(settings.get('date_restrict', 'd1'))
         
         if not keywords or not sites:
             logger.warning(f"{site_name}: No keywords or sites configured")
@@ -307,7 +500,7 @@ class JobSiteScraper:
                     
                     for item in items:
                         title = item.get('title', '')
-                        job_url = item.get('link', '')
+                        job_url = normalize_job_url(item.get('link', ''))
                         snippet = item.get('snippet', '')
                         
                         if not title or not job_url:
@@ -370,7 +563,7 @@ class JobSiteScraper:
             return ''
         href = elem.get('href', '')
         if href:
-            return urljoin(base_url, href)
+            return normalize_job_url(urljoin(base_url, href))
         return ''
 
     async def scrape_html_site(self, site_key: str, site_config: dict) -> list[dict]:
@@ -390,6 +583,10 @@ class JobSiteScraper:
             html = await http_client.fetch(url)
             if not html:
                 health_tracker.record_failure(site_name, "Failed to fetch")
+                return jobs
+            if not keyword_matcher.possibly_present_in_text(html):
+                health_tracker.record_success(site_name, 0)
+                logger.info(f"{site_name}: Skipping parse (no keyword presence in HTML)")
                 return jobs
             
             soup = self.parse_html(html)
@@ -436,7 +633,14 @@ class JobSiteScraper:
                 company_elem = self._find_element(container, company_selector, fallback_company) if company_selector else None
                 company = self._extract_text(company_elem)
                 
-                job = {'title': title, 'company': company, 'url': job_url, 'source': site_name}
+                description = container.get_text(" ", strip=True)[:300]
+                job = {
+                    'title': title,
+                    'company': company,
+                    'url': job_url,
+                    'source': site_name,
+                    'description': description
+                }
                 job_id = self.generate_job_id(title, company, job_url)
                 
                 if self.is_new_job(job_id) and self.matches_keywords(job):
@@ -575,11 +779,6 @@ def parse_args():
         action='store_true',
         help='Only run Google Custom Search scraper (useful for testing Google API setup)'
     )
-    parser.add_argument(
-        '--adzuna-only',
-        action='store_true',
-        help='Only run Adzuna API scraper (useful for testing Adzuna API setup)'
-    )
     return parser.parse_args()
 
 def print_dry_run_report(jobs: list[dict]):
@@ -631,15 +830,13 @@ def print_dry_run_report(jobs: list[dict]):
     print("=" * 60 + "\n")
 
 # ============= MAIN =============
-async def main(dry_run: bool = False, google_only: bool = False, adzuna_only: bool = False):
+async def main(dry_run: bool = False, google_only: bool = False):
     logger.info("=" * 50)
     logger.info("Job Monitor Bot Starting")
     if dry_run:
         logger.info("🧪 DRY RUN MODE - No notifications, no seen_jobs.json updates")
     if google_only:
         logger.info("🔍 GOOGLE ONLY MODE - Only running Google Custom Search")
-    if adzuna_only:
-        logger.info("💼 ADZUNA ONLY MODE - Only running Adzuna API")
     logger.info(f"Search keywords: {SEARCH_KEYWORDS}")
     logger.info(f"Concurrent limit: {CONCURRENT_LIMIT}")
     logger.info("=" * 50)
@@ -677,4 +874,4 @@ async def main(dry_run: bool = False, google_only: bool = False, adzuna_only: bo
 
 if __name__ == "__main__":
     args = parse_args()
-    asyncio.run(main(dry_run=args.dry_run, google_only=args.google_only, adzuna_only=args.adzuna_only))
+    asyncio.run(main(dry_run=args.dry_run, google_only=args.google_only))

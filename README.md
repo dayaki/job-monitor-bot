@@ -4,8 +4,8 @@ Automated job search bot that scrapes 20+ job sites and sends Telegram notificat
 
 ## Features
 
-- **Multi-source scraping** — Searches RemoteOK, Remotive, Adzuna, Google Custom Search, and 15+ HTML job boards
-- **Keyword filtering** — Only notifies you about jobs matching your search terms
+- **Multi-source scraping** — Searches Google Custom Search and 15+ HTML job boards
+- **Title-only keyword filtering** — Matches keywords against job titles only
 - **Duplicate detection** — Tracks seen jobs to avoid repeat notifications
 - **Telegram notifications** — Get instant alerts on your phone
 - **GitHub Actions** — Runs automatically on a schedule (hourly, daily, etc.)
@@ -24,8 +24,6 @@ Go to **Settings → Secrets and variables → Actions** and add:
 | `TELEGRAM_BOT_TOKEN` | ✅       | Your Telegram bot token from [@BotFather](https://t.me/BotFather)           |
 | `TELEGRAM_CHAT_ID`   | ✅       | Your Telegram chat ID (use [@userinfobot](https://t.me/userinfobot))        |
 | `SEARCH_KEYWORDS`    | ✅       | Comma-separated keywords, e.g., `react,react native,mobile`                 |
-| `ADZUNA_APP_ID`      | Optional | Adzuna API app ID from [developer.adzuna.com](https://developer.adzuna.com) |
-| `ADZUNA_APP_KEY`     | Optional | Adzuna API app key                                                          |
 | `GOOGLE_API_KEY`     | Optional | Google Custom Search API key                                                |
 | `GOOGLE_CSE_ID`      | Optional | Google Custom Search Engine ID                                              |
 
@@ -53,7 +51,6 @@ python job_monitor.py --dry-run
 
 # Test specific scrapers
 python job_monitor.py --google-only --dry-run
-python job_monitor.py --adzuna-only --dry-run
 ```
 
 ## Configuration
@@ -84,7 +81,7 @@ Configure Google Custom Search queries:
 settings:
   enabled: true
   max_results_per_query: 10
-  date_restrict: "w1" # Last week
+  date_restrict: "d1" # Last 24 hours (code enforces max d2)
 
 keywords:
   - '"React Native"'
@@ -103,13 +100,12 @@ sites:
 | --------------- | ----------------------------------------------------------------------- |
 | `--dry-run`     | Test mode: scrape but don't send notifications or update seen_jobs.json |
 | `--google-only` | Only run Google Custom Search scraper                                   |
-| `--adzuna-only` | Only run Adzuna API scraper                                             |
 
 ## How It Works
 
 1. **Load seen jobs** from `seen_jobs.json`
 2. **Scrape all sources** concurrently (APIs + HTML sites)
-3. **Filter jobs** by keywords (searches title, company, description)
+3. **Filter jobs** by keywords (searches title only)
 4. **Deduplicate** using job IDs (skips already-seen jobs)
 5. **Send Telegram notification** with new matches
 6. **Save seen jobs** to prevent future duplicates
