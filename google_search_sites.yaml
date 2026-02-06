@@ -22,9 +22,9 @@ settings:
   enabled: true
   max_results_per_query: 10
   # Date restrict: limit results to recent posts
-  # Options: d[number] = days, w[number] = weeks, m[number] = months
-  # Example: d7 = last 7 days, w2 = last 2 weeks
-  date_restrict: "w1"
+  # Keep this at d1 (24h) for fastest alerts; d2 is the maximum enforced by code.
+  # Supported input examples: d1, d2 (w/m values are clamped to d2)
+  date_restrict: "d1"
 
 # Keywords to search for (combined with each site)
 # Use quotes for exact phrases
