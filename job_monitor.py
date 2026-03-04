@@ -8,6 +8,7 @@ import argparse
 import asyncio
 import aiohttp
 import hashlib
+import html
 import json
 import logging
 import os
@@ -75,6 +76,18 @@ RETRY_MAX_DELAY = REQUEST_CONFIG.get('retry_max_delay', 10.0)
 CONCURRENT_LIMIT = REQUEST_CONFIG.get('concurrent_limit', 10)
 SEEN_JOBS_MAX = REQUEST_CONFIG.get('seen_jobs_max', 5000)
 SEEN_JOBS_TTL_DAYS = REQUEST_CONFIG.get('seen_jobs_ttl_days', 90)
+TELEGRAM_MAX_RETRIES = REQUEST_CONFIG.get('telegram_max_retries', 3)
+TELEGRAM_RETRY_BASE_DELAY = REQUEST_CONFIG.get('telegram_retry_base_delay', 1.0)
+TELEGRAM_RETRY_MAX_DELAY = REQUEST_CONFIG.get('telegram_retry_max_delay', 10.0)
+
+SENSITIVE_QUERY_KEYS = {
+    'access_token',
+    'api_key',
+    'authorization',
+    'key',
+    'password',
+    'token',
+}
 
 
 def normalize_job_url(url: str) -> str:
@@ -92,6 +105,23 @@ def normalize_job_url(url: str) -> str:
         return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(clean_query), ''))
     except Exception:
         return url.strip()
+
+
+def redact_url(url: str) -> str:
+    """Mask sensitive query parameters before logging."""
+    if not url:
+        return ''
+    try:
+        parts = urlsplit(url)
+        redacted_query = []
+        for key, value in parse_qsl(parts.query, keep_blank_values=True):
+            if key.lower() in SENSITIVE_QUERY_KEYS:
+                redacted_query.append((key, 'REDACTED'))
+            else:
+                redacted_query.append((key, value))
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(redacted_query), ''))
+    except Exception:
+        return url
 
 
 def clamp_google_date_restrict(raw_value: str) -> str:
@@ -252,13 +282,33 @@ class AsyncHTTPClient:
         except Exception as e:
             logger.debug(f"Failed to save persistent cache: {e}")
 
-    def _cache_key(self, url: str, return_json: bool) -> str:
-        return f"{url}|json={1 if return_json else 0}"
+    def _serialize_params(self, params: Optional[dict[str, Any]]) -> str:
+        if not params:
+            return ''
+        items: list[tuple[str, str]] = []
+        for key in sorted(params.keys()):
+            raw_value = params[key]
+            if isinstance(raw_value, (list, tuple)):
+                for item in raw_value:
+                    items.append((str(key), str(item)))
+            else:
+                items.append((str(key), str(raw_value)))
+        return urlencode(items)
 
-    async def _get_cached(self, url: str, return_json: bool) -> Optional[str | dict]:
+    def _build_request_url(self, url: str, params: Optional[dict[str, Any]]) -> str:
+        serialized_params = self._serialize_params(params)
+        if not serialized_params:
+            return url
+        separator = '&' if '?' in url else '?'
+        return f"{url}{separator}{serialized_params}"
+
+    def _cache_key(self, request_url: str, return_json: bool) -> str:
+        return f"{request_url}|json={1 if return_json else 0}"
+
+    async def _get_cached(self, request_url: str, return_json: bool) -> Optional[str | dict]:
         if self._cache_ttl_seconds <= 0:
             return None
-        key = self._cache_key(url, return_json)
+        key = self._cache_key(request_url, return_json)
         now = time.time()
         async with self._cache_lock:
             entry = self._response_cache.get(key)
@@ -269,7 +319,7 @@ class AsyncHTTPClient:
                 return None
             return entry.get('value')
 
-    async def _set_cached(self, url: str, return_json: bool, value: str | dict):
+    async def _set_cached(self, request_url: str, return_json: bool, value: str | dict):
         if self._cache_ttl_seconds <= 0:
             return
         persistable = not (
@@ -277,7 +327,7 @@ class AsyncHTTPClient:
             isinstance(value, str) and
             len(value) > self._persistent_cache_value_limit
         )
-        key = self._cache_key(url, return_json)
+        key = self._cache_key(request_url, return_json)
         entry = {'ts': time.time(), 'value': value, 'persistable': persistable}
         async with self._cache_lock:
             self._response_cache[key] = entry
@@ -303,8 +353,15 @@ class AsyncHTTPClient:
                 await asyncio.sleep(delay)
             self._domain_last_request[domain] = time.time()
     
-    async def fetch(self, url: str, return_json: bool = False) -> Optional[str | dict]:
-        cached = await self._get_cached(url, return_json)
+    async def fetch(
+        self,
+        url: str,
+        return_json: bool = False,
+        params: Optional[dict[str, Any]] = None
+    ) -> Optional[str | dict]:
+        request_url = self._build_request_url(url, params)
+        safe_request_url = redact_url(request_url)
+        cached = await self._get_cached(request_url, return_json)
         if cached is not None:
             return cached
 
@@ -316,24 +373,24 @@ class AsyncHTTPClient:
             for attempt in range(MAX_RETRIES):
                 try:
                     await self._apply_domain_throttle(domain)
-                    async with session.get(url) as response:
+                    async with session.get(url, params=params) as response:
                         if response.status == 200:
                             if return_json:
                                 text = await response.text()
                                 if not text or not text.strip():
-                                    logger.warning(f"Empty response from {url}")
+                                    logger.warning(f"Empty response from {safe_request_url}")
                                     return None
                                 try:
                                     payload = json.loads(text)
-                                    await self._set_cached(url, return_json, payload)
+                                    await self._set_cached(request_url, return_json, payload)
                                     return payload
                                 except json.JSONDecodeError as e:
-                                    logger.warning(f"Invalid JSON response from {url}: {e}")
+                                    logger.warning(f"Invalid JSON response from {safe_request_url}: {e}")
                                     logger.debug(f"Response content: {text[:500]}")
                                     return None
                             else:
                                 text = await response.text()
-                                await self._set_cached(url, return_json, text)
+                                await self._set_cached(request_url, return_json, text)
                                 return text
                         elif response.status == 429:
                             last_error = "rate_limited"
@@ -345,31 +402,43 @@ class AsyncHTTPClient:
                                 except ValueError:
                                     pass
                             self._domain_backoff_until[domain] = time.time() + delay
-                            logger.warning(f"Rate limited on {url}, waiting {delay}s")
+                            logger.warning(f"Rate limited on {safe_request_url}, waiting {delay}s")
                             await asyncio.sleep(delay)
                         elif response.status in (502, 503, 504):
                             delay = min(RETRY_BASE_DELAY * (2 ** attempt), RETRY_MAX_DELAY)
-                            logger.warning(f"HTTP {response.status} for {url}, retrying in {delay}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                            logger.warning(
+                                f"HTTP {response.status} for {safe_request_url}, "
+                                f"retrying in {delay}s (attempt {attempt + 1}/{MAX_RETRIES})"
+                            )
                             await asyncio.sleep(delay)
                             continue
                         else:
-                            logger.warning(f"HTTP {response.status} for {url}")
+                            logger.warning(f"HTTP {response.status} for {safe_request_url}")
                             return None
                 except asyncio.TimeoutError:
                     last_error = "timeout"
-                    logger.warning(f"Timeout fetching {url} (attempt {attempt + 1}/{MAX_RETRIES})")
+                    logger.warning(
+                        f"Timeout fetching {safe_request_url} "
+                        f"(attempt {attempt + 1}/{MAX_RETRIES})"
+                    )
                 except aiohttp.ClientError as e:
                     last_error = str(e)
-                    logger.warning(f"Client error: {e} (attempt {attempt + 1}/{MAX_RETRIES})")
+                    logger.warning(
+                        f"Client error for {safe_request_url}: {e} "
+                        f"(attempt {attempt + 1}/{MAX_RETRIES})"
+                    )
                 except Exception as e:
-                    logger.error(f"Unexpected error fetching {url}: {e}")
+                    logger.error(f"Unexpected error fetching {safe_request_url}: {e}")
                     return None
                 
                 if attempt < MAX_RETRIES - 1:
                     delay = min(RETRY_BASE_DELAY * (2 ** attempt), RETRY_MAX_DELAY)
                     await asyncio.sleep(delay)
             
-            logger.error(f"Failed to fetch {url} after {MAX_RETRIES} attempts: {last_error}")
+            logger.error(
+                f"Failed to fetch {safe_request_url} "
+                f"after {MAX_RETRIES} attempts: {last_error}"
+            )
             return None
 
 http_client = AsyncHTTPClient()
@@ -379,6 +448,7 @@ class JobSiteScraper:
     def __init__(self, seen_jobs_file: str = 'seen_jobs.json'):
         self.seen_jobs_file = seen_jobs_file
         self.seen_jobs = self.load_seen_jobs()
+        self.pending_job_ids: set[str] = set()
     
     def load_seen_jobs(self) -> dict[str, float]:
         try:
@@ -433,10 +503,16 @@ class JobSiteScraper:
         return keyword_matcher.matches_title(job.get('title', ''))
     
     def is_new_job(self, job_id: str) -> bool:
-        return job_id not in self.seen_jobs
+        return job_id not in self.seen_jobs and job_id not in self.pending_job_ids
     
-    def mark_as_seen(self, job_id: str):
-        self.seen_jobs[job_id] = time.time()
+    def queue_job_id(self, job_id: str):
+        self.pending_job_ids.add(job_id)
+
+    def mark_jobs_as_seen(self, job_ids: list[str]):
+        now = time.time()
+        for job_id in job_ids:
+            self.seen_jobs[job_id] = now
+            self.pending_job_ids.discard(job_id)
     
     def parse_html(self, html: str) -> BeautifulSoup:
         try:
@@ -495,16 +571,17 @@ class JobSiteScraper:
 
             for keyword, domain, source_name in selected_queries:
                 query = f'{keyword} site:{domain} remote'
-                params = urlencode({
-                    'key': GOOGLE_API_KEY,
-                    'cx': GOOGLE_CSE_ID,
-                    'q': query,
-                    'num': max_results,
-                    'dateRestrict': date_restrict,
-                })
-                url = f"https://www.googleapis.com/customsearch/v1?{params}"
-
-                data = await http_client.fetch(url, return_json=True)
+                data = await http_client.fetch(
+                    "https://www.googleapis.com/customsearch/v1",
+                    return_json=True,
+                    params={
+                        'key': GOOGLE_API_KEY,
+                        'cx': GOOGLE_CSE_ID,
+                        'q': query,
+                        'num': max_results,
+                        'dateRestrict': date_restrict,
+                    }
+                )
                 total_queries += 1
 
                 if not data:
@@ -558,7 +635,7 @@ class JobSiteScraper:
                     if self.is_new_job(job_id) and self.matches_keywords(job):
                         job['id'] = job_id
                         jobs.append(job)
-                        self.mark_as_seen(job_id)
+                        self.queue_job_id(job_id)
 
                 await asyncio.sleep(min_seconds_between_queries)
             
@@ -676,7 +753,7 @@ class JobSiteScraper:
                 if self.is_new_job(job_id) and self.matches_keywords(job):
                     job['id'] = job_id
                     jobs.append(job)
-                    self.mark_as_seen(job_id)
+                    self.queue_job_id(job_id)
             
             health_tracker.record_success(site_name, len(jobs))
             logger.info(f"{site_name}: Found {len(jobs)} new matching jobs")
@@ -741,53 +818,108 @@ async def send_telegram_notification(jobs: list[dict]) -> bool:
     
     try:
         session = await http_client.get_session()
-        
-        header = f"🔔 *{len(jobs)} New Job(s) Found!*\n"
+
+        def _escape_text(value: str, max_length: int, fallback: str = 'Unknown') -> str:
+            normalized = (value or '').strip()
+            if not normalized:
+                normalized = fallback
+            return html.escape(normalized[:max_length], quote=False)
+
+        header = f"🔔 <b>{len(jobs)} New Job(s) Found!</b>\n"
         header += f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
-        header += f"🔍 Keywords: {', '.join(SEARCH_KEYWORDS[:3])}\n"
+        header += f"🔍 Keywords: {_escape_text(', '.join(SEARCH_KEYWORDS[:3]), 120)}\n"
         header += "─" * 30 + "\n\n"
-        
+
         messages = []
         current_message = header
-        
+
         for i, job in enumerate(jobs, 1):
-            title = job.get('title', 'Unknown')[:100]
-            company = job.get('company', 'Unknown')[:50]
-            url = job.get('url', '')
-            source = job.get('source', 'Unknown')
-            
-            job_text = f"*{i}. {title}*\n"
-            job_text += f"🏢 {company}\n" if company else ""
+            title = _escape_text(job.get('title', ''), 100)
+            company = _escape_text(job.get('company', ''), 50, fallback='')
+            source = _escape_text(job.get('source', ''), 60)
+            url = html.escape(job.get('url', ''), quote=True)
+
+            job_text = f"<b>{i}. {title}</b>\n"
+            if company:
+                job_text += f"🏢 {company}\n"
             job_text += f"🌐 {source}\n"
-            job_text += f"🔗 [Apply Here]({url})\n\n"
-            
+            if url:
+                job_text += f"🔗 <a href=\"{url}\">Apply Here</a>\n\n"
+            else:
+                job_text += "🔗 No URL provided\n\n"
+
             if len(current_message) + len(job_text) > 4000:
                 messages.append(current_message)
                 current_message = header + job_text
             else:
                 current_message += job_text
-        
+
         if current_message:
             messages.append(current_message)
-        
+
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        
+
         for msg in messages:
             payload = {
                 'chat_id': TELEGRAM_CHAT_ID,
                 'text': msg,
-                'parse_mode': 'Markdown',
+                'parse_mode': 'HTML',
                 'disable_web_page_preview': True
             }
-            
-            async with session.post(url, json=payload) as response:
-                if response.status != 200:
-                    error_text = await response.text()
-                    logger.error(f"Telegram API error: {error_text}")
+
+            delivered = False
+            for attempt in range(TELEGRAM_MAX_RETRIES):
+                try:
+                    async with session.post(url, json=payload) as response:
+                        if response.status == 200:
+                            delivered = True
+                            break
+
+                        error_text = await response.text()
+                        retriable = response.status in (429, 500, 502, 503, 504)
+                        if not retriable:
+                            logger.error(f"Telegram API error (status {response.status}): {error_text}")
+                            return False
+
+                        delay = min(
+                            TELEGRAM_RETRY_BASE_DELAY * (2 ** attempt),
+                            TELEGRAM_RETRY_MAX_DELAY
+                        )
+                        if response.status == 429:
+                            try:
+                                error_payload = json.loads(error_text)
+                                retry_after = float(
+                                    error_payload.get('parameters', {}).get('retry_after', 0)
+                                )
+                                delay = max(delay, retry_after)
+                            except Exception:
+                                pass
+                        logger.warning(
+                            f"Telegram API temporary error (status {response.status}), "
+                            f"retrying in {delay}s (attempt {attempt + 1}/{TELEGRAM_MAX_RETRIES})"
+                        )
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    delay = min(
+                        TELEGRAM_RETRY_BASE_DELAY * (2 ** attempt),
+                        TELEGRAM_RETRY_MAX_DELAY
+                    )
+                    logger.warning(
+                        f"Telegram delivery failed ({e}), retrying in {delay}s "
+                        f"(attempt {attempt + 1}/{TELEGRAM_MAX_RETRIES})"
+                    )
+                except Exception as e:
+                    logger.error(f"Unexpected Telegram error: {e}")
                     return False
-            
+
+                if attempt < TELEGRAM_MAX_RETRIES - 1:
+                    await asyncio.sleep(delay)
+
+            if not delivered:
+                logger.error("Telegram delivery failed after retries")
+                return False
+
             await asyncio.sleep(0.5)
-        
+
         logger.info(f"Successfully sent {len(messages)} Telegram message(s)")
         return True
     except Exception as e:
@@ -888,7 +1020,10 @@ async def main(dry_run: bool = False, google_only: bool = False):
         else:
             if new_jobs:
                 logger.info(f"Found {len(new_jobs)} new matching jobs")
-                await send_telegram_notification(new_jobs)
+                notification_sent = await send_telegram_notification(new_jobs)
+                if not notification_sent:
+                    raise RuntimeError("Notification failed. Keeping jobs unseen for retry on next run.")
+                scraper.mark_jobs_as_seen([job.get('id', '') for job in new_jobs if job.get('id')])
             else:
                 logger.info("No new matching jobs found")
             

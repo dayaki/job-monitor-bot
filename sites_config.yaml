@@ -209,3 +209,22 @@ sites:
       job_container: ".job-listing"
       title: ".job-title"
       link: "a[href*='/job/']"
+
+# Global runtime tuning for HTTP behavior, caching, and seen-jobs retention.
+request:
+  timeout: 15
+  max_retries: 3
+  retry_base_delay: 1.0
+  retry_max_delay: 10.0
+  concurrent_limit: 10
+  per_domain_min_interval: 0.2
+  cache_ttl_seconds: 900
+  cache_max_entries: 500
+  persistent_cache_enabled: false
+  persistent_cache_file: "http_cache.json"
+  persistent_cache_value_limit: 100000
+  seen_jobs_max: 5000
+  seen_jobs_ttl_days: 90
+  telegram_max_retries: 3
+  telegram_retry_base_delay: 1.0
+  telegram_retry_max_delay: 10.0

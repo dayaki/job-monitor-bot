@@ -10,6 +10,10 @@ on:
 
   workflow_dispatch: # Allows manual trigger from GitHub Actions tab
 
+concurrency:
+  group: job-monitor-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   search-jobs:
     runs-on: ubuntu-latest
@@ -21,6 +25,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -53,12 +58,8 @@ jobs:
       - name: Run job search
         env:
           SEARCH_KEYWORDS: ${{ secrets.SEARCH_KEYWORDS }}
-          NOTIFICATION_METHOD: ${{ secrets.NOTIFICATION_METHOD }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
-          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-          EMAIL_RECIPIENT: ${{ secrets.EMAIL_RECIPIENT }}
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           GOOGLE_CSE_ID: ${{ secrets.GOOGLE_CSE_ID }}
         run: |
@@ -71,8 +72,20 @@ jobs:
           git add seen_jobs.json
           if ! git diff --quiet --cached; then
             git commit -m "Update seen jobs [skip ci]"
-            git push
-            echo "✓ Seen jobs updated and pushed"
+            for attempt in 1 2 3; do
+              if git pull --rebase origin "${GITHUB_REF_NAME}"; then
+                if git push; then
+                  echo "✓ Seen jobs updated and pushed"
+                  exit 0
+                fi
+              else
+                git rebase --abort || true
+              fi
+              echo "Retrying push (attempt ${attempt}/3)"
+              sleep $((attempt * 2))
+            done
+            echo "::error::Failed to push seen_jobs.json after 3 attempts"
+            exit 1
           else
             echo "ℹ No changes to seen jobs"
           fi
