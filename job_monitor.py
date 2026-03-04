@@ -336,7 +336,14 @@ class AsyncHTTPClient:
                                 await self._set_cached(url, return_json, text)
                                 return text
                         elif response.status == 429:
+                            last_error = "rate_limited"
                             delay = min(RETRY_BASE_DELAY * (2 ** attempt), RETRY_MAX_DELAY)
+                            retry_after = response.headers.get('Retry-After')
+                            if retry_after:
+                                try:
+                                    delay = max(delay, float(retry_after))
+                                except ValueError:
+                                    pass
                             self._domain_backoff_until[domain] = time.time() + delay
                             logger.warning(f"Rate limited on {url}, waiting {delay}s")
                             await asyncio.sleep(delay)
@@ -458,79 +465,102 @@ class JobSiteScraper:
         sites = google_config.get('sites', [])
         max_results = settings.get('max_results_per_query', 10)
         date_restrict = clamp_google_date_restrict(settings.get('date_restrict', 'd1'))
+        max_queries_per_run = max(1, int(settings.get('max_queries_per_run', 12)))
+        min_seconds_between_queries = max(0.5, float(settings.get('min_seconds_between_queries', 1.2)))
+        max_consecutive_failures = max(1, int(settings.get('max_consecutive_failures', 4)))
         
         if not keywords or not sites:
             logger.warning(f"{site_name}: No keywords or sites configured")
             return jobs
         
         try:
-            total_queries = 0
-            
+            all_queries: list[tuple[str, str, str]] = []
             for site_entry in sites:
                 domain = site_entry.get('domain', '')
                 source_name = site_entry.get('name', domain)
-                
                 if not domain:
                     continue
-                
                 for keyword in keywords:
-                    query = f'{keyword} site:{domain} remote'
-                    
-                    url = (
-                        f"https://www.googleapis.com/customsearch/v1"
-                        f"?key={GOOGLE_API_KEY}"
-                        f"&cx={GOOGLE_CSE_ID}"
-                        f"&q={query}"
-                        f"&num={max_results}"
-                        f"&dateRestrict={date_restrict}"
-                    )
-                    
-                    data = await http_client.fetch(url, return_json=True)
-                    total_queries += 1
-                    
-                    if not data:
+                    all_queries.append((keyword, domain, source_name))
+
+            total_available_queries = len(all_queries)
+            selected_queries = all_queries[:max_queries_per_run]
+            if total_available_queries > max_queries_per_run:
+                logger.info(
+                    f"{site_name}: Query budget enabled ({max_queries_per_run}/{total_available_queries} queries this run)"
+                )
+
+            total_queries = 0
+            consecutive_failures = 0
+
+            for keyword, domain, source_name in selected_queries:
+                query = f'{keyword} site:{domain} remote'
+                params = urlencode({
+                    'key': GOOGLE_API_KEY,
+                    'cx': GOOGLE_CSE_ID,
+                    'q': query,
+                    'num': max_results,
+                    'dateRestrict': date_restrict,
+                })
+                url = f"https://www.googleapis.com/customsearch/v1?{params}"
+
+                data = await http_client.fetch(url, return_json=True)
+                total_queries += 1
+
+                if not data:
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_consecutive_failures:
+                        logger.warning(
+                            f"{site_name}: Stopping early after {consecutive_failures} consecutive failed queries "
+                            f"(likely quota/rate-limit pressure)"
+                        )
+                        break
+                    await asyncio.sleep(min_seconds_between_queries)
+                    continue
+
+                consecutive_failures = 0
+
+                if 'error' in data:
+                    error_msg = data['error'].get('message', 'Unknown error')
+                    logger.warning(f"{site_name}: API error - {error_msg}")
+                    await asyncio.sleep(min_seconds_between_queries)
+                    continue
+
+                items = data.get('items', [])
+
+                for item in items:
+                    title = item.get('title', '')
+                    job_url = normalize_job_url(item.get('link', ''))
+                    snippet = item.get('snippet', '')
+
+                    if not title or not job_url:
                         continue
-                    
-                    if 'error' in data:
-                        error_msg = data['error'].get('message', 'Unknown error')
-                        logger.warning(f"{site_name}: API error - {error_msg}")
-                        continue
-                    
-                    items = data.get('items', [])
-                    
-                    for item in items:
-                        title = item.get('title', '')
-                        job_url = normalize_job_url(item.get('link', ''))
-                        snippet = item.get('snippet', '')
-                        
-                        if not title or not job_url:
-                            continue
-                        
-                        company = ''
-                        if ' - ' in title:
-                            parts = title.rsplit(' - ', 1)
-                            if len(parts) == 2:
-                                title, company = parts[0].strip(), parts[1].strip()
-                        elif ' | ' in title:
-                            parts = title.rsplit(' | ', 1)
-                            if len(parts) == 2:
-                                title, company = parts[0].strip(), parts[1].strip()
-                        
-                        job = {
-                            'title': title,
-                            'company': company,
-                            'url': job_url,
-                            'source': f"Google-{source_name}",
-                            'description': snippet
-                        }
-                        job_id = self.generate_job_id(title, company, job_url)
-                        
-                        if self.is_new_job(job_id) and self.matches_keywords(job):
-                            job['id'] = job_id
-                            jobs.append(job)
-                            self.mark_as_seen(job_id)
-                    
-                    await asyncio.sleep(0.1)
+
+                    company = ''
+                    if ' - ' in title:
+                        parts = title.rsplit(' - ', 1)
+                        if len(parts) == 2:
+                            title, company = parts[0].strip(), parts[1].strip()
+                    elif ' | ' in title:
+                        parts = title.rsplit(' | ', 1)
+                        if len(parts) == 2:
+                            title, company = parts[0].strip(), parts[1].strip()
+
+                    job = {
+                        'title': title,
+                        'company': company,
+                        'url': job_url,
+                        'source': f"Google-{source_name}",
+                        'description': snippet
+                    }
+                    job_id = self.generate_job_id(title, company, job_url)
+
+                    if self.is_new_job(job_id) and self.matches_keywords(job):
+                        job['id'] = job_id
+                        jobs.append(job)
+                        self.mark_as_seen(job_id)
+
+                await asyncio.sleep(min_seconds_between_queries)
             
             health_tracker.record_success(site_name, len(jobs))
             logger.info(f"{site_name}: Found {len(jobs)} new jobs from {total_queries} queries")
