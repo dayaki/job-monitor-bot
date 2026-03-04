@@ -57,20 +57,32 @@ python job_monitor.py --google-only --dry-run
 
 ### `sites_config.yaml`
 
-Configure HTML job sites with CSS selectors:
+Configure HTML job sites and runtime request tuning:
 
 ```yaml
-weworkremotely:
-  name: "WeWorkRemotely"
-  url: "https://weworkremotely.com/remote-jobs/search?term=developer"
-  type: "html"
-  enabled: true
-  max_jobs: 20
-  selectors:
-    job_container: ".jobs article"
-    title: ".title"
-    company: ".company"
-    link: "a"
+sites:
+  weworkremotely:
+    name: "WeWorkRemotely"
+    url: "https://weworkremotely.com/remote-jobs/search?term=developer"
+    type: "html"
+    enabled: true
+    max_jobs: 20
+    selectors:
+      job_container: ".jobs article"
+      title: ".title"
+      company: ".company"
+      link: "a"
+
+request:
+  timeout: 15
+  max_retries: 3
+  retry_base_delay: 1.0
+  retry_max_delay: 10.0
+  concurrent_limit: 10
+  per_domain_min_interval: 0.2
+  cache_ttl_seconds: 900
+  seen_jobs_ttl_days: 90
+  telegram_max_retries: 3
 ```
 
 ### `google_search_sites.yaml`
@@ -106,9 +118,9 @@ sites:
 1. **Load seen jobs** from `seen_jobs.json`
 2. **Scrape all sources** concurrently (APIs + HTML sites)
 3. **Filter jobs** by keywords (searches title only)
-4. **Deduplicate** using job IDs (skips already-seen jobs)
-5. **Send Telegram notification** with new matches
-6. **Save seen jobs** to prevent future duplicates
+4. **Deduplicate** using job IDs (skips already-seen jobs and in-run duplicates)
+5. **Send Telegram notification** with retries
+6. **Persist seen jobs only after successful notification**
 
 ## Adding New Job Sites
 
@@ -117,16 +129,17 @@ sites:
 Add an entry to `sites_config.yaml`:
 
 ```yaml
-my_new_site:
-  name: "My New Site"
-  url: "https://example.com/jobs"
-  type: "html"
-  enabled: true
-  selectors:
-    job_container: ".job-card"
-    title: "h2"
-    company: ".company-name"
-    link: "a"
+sites:
+  my_new_site:
+    name: "My New Site"
+    url: "https://example.com/jobs"
+    type: "html"
+    enabled: true
+    selectors:
+      job_container: ".job-card"
+      title: "h2"
+      company: ".company-name"
+      link: "a"
 ```
 
 ### Google Search Sites
