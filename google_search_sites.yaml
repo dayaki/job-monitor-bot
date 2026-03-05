@@ -27,9 +27,9 @@ settings:
   date_restrict: "d1"
   # Query budget controls to avoid Google API 429s / daily quota burn.
   # Total query combinations = len(keywords) * len(sites); only this many run per cycle.
-  max_queries_per_run: 12
-  min_seconds_between_queries: 1.2
-  max_consecutive_failures: 4
+  max_queries_per_run: 3
+  min_seconds_between_queries: 2.0
+  max_consecutive_failures: 1
 
 # Keywords to search for (combined with each site)
 # Use quotes for exact phrases
