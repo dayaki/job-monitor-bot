@@ -12,6 +12,7 @@ import html
 import json
 import logging
 import os
+import random
 import re
 import sys
 import time
@@ -69,6 +70,7 @@ def load_google_search_config() -> dict:
 
 CONFIG = load_config()
 REQUEST_CONFIG = CONFIG.get('request', {})
+LOCATION_FILTER_CONFIG = CONFIG.get('location_filter', {})
 TIMEOUT = REQUEST_CONFIG.get('timeout', 15)
 MAX_RETRIES = REQUEST_CONFIG.get('max_retries', 3)
 RETRY_BASE_DELAY = REQUEST_CONFIG.get('retry_base_delay', 1.0)
@@ -138,6 +140,43 @@ def clamp_google_date_restrict(raw_value: str) -> str:
         return f'd{max(1, min(count, 2))}'
     # Weeks/months are intentionally reduced to 2 days max.
     return 'd2'
+
+
+def coerce_string_list(value: Any, default: list[str]) -> list[str]:
+    if isinstance(value, list):
+        values = [str(item).strip().lower() for item in value if str(item).strip()]
+        return values if values else default
+    return default
+
+
+def google_error_is_quota_or_rate_limited(error_payload: dict[str, Any]) -> bool:
+    if not isinstance(error_payload, dict):
+        return False
+    code = error_payload.get('code')
+    message = str(error_payload.get('message', '')).lower()
+    if code == 429:
+        return True
+    if any(token in message for token in ('quota', 'rate limit', 'too many requests')):
+        return True
+    for entry in error_payload.get('errors', []) or []:
+        reason = str((entry or {}).get('reason', '')).lower()
+        if 'quota' in reason or 'ratelimit' in reason:
+            return True
+    return False
+
+
+def select_rotating_window(
+    items: list[tuple[str, str, str]],
+    window_size: int,
+    schedule_interval_seconds: int
+) -> tuple[list[tuple[str, str, str]], int, int]:
+    if not items:
+        return [], 0, 0
+    bounded_window = max(1, min(window_size, len(items)))
+    slot = int(time.time() // max(1, schedule_interval_seconds))
+    start = (slot * bounded_window) % len(items)
+    selected = [items[(start + index) % len(items)] for index in range(bounded_window)]
+    return selected, slot, start
 
 
 class KeywordMatcher:
@@ -357,12 +396,21 @@ class AsyncHTTPClient:
         self,
         url: str,
         return_json: bool = False,
-        params: Optional[dict[str, Any]] = None
+        params: Optional[dict[str, Any]] = None,
+        max_retries_override: Optional[int] = None,
+        fail_fast_on_rate_limit: bool = False,
+        error_state: Optional[dict[str, Any]] = None
     ) -> Optional[str | dict]:
+        attempts = max(1, int(max_retries_override if max_retries_override is not None else MAX_RETRIES))
         request_url = self._build_request_url(url, params)
         safe_request_url = redact_url(request_url)
+        if error_state is not None:
+            error_state.clear()
+            error_state.update({'last_error': None, 'status': None, 'rate_limited': False})
         cached = await self._get_cached(request_url, return_json)
         if cached is not None:
+            if error_state is not None:
+                error_state.update({'status': 200})
             return cached
 
         async with self._semaphore:
@@ -370,10 +418,12 @@ class AsyncHTTPClient:
             last_error = None
             domain = urlsplit(url).netloc.lower()
             
-            for attempt in range(MAX_RETRIES):
+            for attempt in range(attempts):
                 try:
                     await self._apply_domain_throttle(domain)
                     async with session.get(url, params=params) as response:
+                        if error_state is not None:
+                            error_state.update({'status': response.status})
                         if response.status == 200:
                             if return_json:
                                 text = await response.text()
@@ -394,6 +444,8 @@ class AsyncHTTPClient:
                                 return text
                         elif response.status == 429:
                             last_error = "rate_limited"
+                            if error_state is not None:
+                                error_state.update({'last_error': last_error, 'rate_limited': True})
                             delay = min(RETRY_BASE_DELAY * (2 ** attempt), RETRY_MAX_DELAY)
                             retry_after = response.headers.get('Retry-After')
                             if retry_after:
@@ -401,6 +453,9 @@ class AsyncHTTPClient:
                                     delay = max(delay, float(retry_after))
                                 except ValueError:
                                     pass
+                            if fail_fast_on_rate_limit:
+                                logger.warning(f"Rate limited on {safe_request_url}; fail-fast enabled")
+                                return None
                             self._domain_backoff_until[domain] = time.time() + delay
                             logger.warning(f"Rate limited on {safe_request_url}, waiting {delay}s")
                             await asyncio.sleep(delay)
@@ -408,37 +463,46 @@ class AsyncHTTPClient:
                             delay = min(RETRY_BASE_DELAY * (2 ** attempt), RETRY_MAX_DELAY)
                             logger.warning(
                                 f"HTTP {response.status} for {safe_request_url}, "
-                                f"retrying in {delay}s (attempt {attempt + 1}/{MAX_RETRIES})"
+                                f"retrying in {delay}s (attempt {attempt + 1}/{attempts})"
                             )
                             await asyncio.sleep(delay)
                             continue
                         else:
+                            last_error = f"http_{response.status}"
+                            if error_state is not None:
+                                error_state.update({'last_error': last_error})
                             logger.warning(f"HTTP {response.status} for {safe_request_url}")
                             return None
                 except asyncio.TimeoutError:
                     last_error = "timeout"
+                    if error_state is not None:
+                        error_state.update({'last_error': last_error})
                     logger.warning(
                         f"Timeout fetching {safe_request_url} "
-                        f"(attempt {attempt + 1}/{MAX_RETRIES})"
+                        f"(attempt {attempt + 1}/{attempts})"
                     )
                 except aiohttp.ClientError as e:
                     last_error = str(e)
+                    if error_state is not None:
+                        error_state.update({'last_error': last_error})
                     logger.warning(
                         f"Client error for {safe_request_url}: {e} "
-                        f"(attempt {attempt + 1}/{MAX_RETRIES})"
+                        f"(attempt {attempt + 1}/{attempts})"
                     )
                 except Exception as e:
                     logger.error(f"Unexpected error fetching {safe_request_url}: {e}")
                     return None
                 
-                if attempt < MAX_RETRIES - 1:
+                if attempt < attempts - 1:
                     delay = min(RETRY_BASE_DELAY * (2 ** attempt), RETRY_MAX_DELAY)
                     await asyncio.sleep(delay)
             
             logger.error(
                 f"Failed to fetch {safe_request_url} "
-                f"after {MAX_RETRIES} attempts: {last_error}"
+                f"after {attempts} attempts: {last_error}"
             )
+            if error_state is not None:
+                error_state.update({'last_error': last_error})
             return None
 
 http_client = AsyncHTTPClient()
@@ -449,6 +513,57 @@ class JobSiteScraper:
         self.seen_jobs_file = seen_jobs_file
         self.seen_jobs = self.load_seen_jobs()
         self.pending_job_ids: set[str] = set()
+        self.location_filter_mode = str(
+            LOCATION_FILTER_CONFIG.get('location_filter_mode', 'strict_remote_with_exception')
+        ).strip().lower()
+        self.location_remote_terms = coerce_string_list(
+            LOCATION_FILTER_CONFIG.get('location_remote_terms'),
+            [
+                'remote',
+                'work from home',
+                'wfh',
+                'distributed',
+                'anywhere',
+            ]
+        )
+        self.location_hybrid_terms = coerce_string_list(
+            LOCATION_FILTER_CONFIG.get('location_hybrid_terms'),
+            [
+                'hybrid',
+                '2 days onsite',
+                '3 days onsite',
+                'partially remote',
+            ]
+        )
+        self.location_onsite_terms = coerce_string_list(
+            LOCATION_FILTER_CONFIG.get('location_onsite_terms'),
+            [
+                'onsite',
+                'on-site',
+                'in office',
+                'office based',
+                'on site',
+            ]
+        )
+        self.location_exception_terms = coerce_string_list(
+            LOCATION_FILTER_CONFIG.get('location_exception_terms'),
+            [
+                'visa sponsorship',
+                'sponsorship available',
+                'relocation support',
+                'willing to relocate',
+                'relocation assistance',
+            ]
+        )
+        self.metrics = {
+            'google_queries_available': 0,
+            'google_queries_executed': 0,
+            'google_queries_skipped_by_budget': 0,
+            'google_rate_limited': 0,
+            'google_stopped_early_reason': '',
+            'jobs_rejected_location': 0,
+            'jobs_accepted_exception': 0,
+        }
     
     def load_seen_jobs(self) -> dict[str, float]:
         try:
@@ -513,6 +628,49 @@ class JobSiteScraper:
         for job_id in job_ids:
             self.seen_jobs[job_id] = now
             self.pending_job_ids.discard(job_id)
+
+    @staticmethod
+    def _contains_any_term(text: str, terms: list[str]) -> bool:
+        return any(term in text for term in terms)
+
+    def classify_location(self, job: dict) -> dict[str, Any]:
+        if self.location_filter_mode != 'strict_remote_with_exception':
+            return {'accepted': True, 'accepted_by_exception': False, 'reason': 'filter_disabled'}
+
+        title = str(job.get('title', '')).lower()
+        description = str(job.get('description', '')).lower()
+        searchable = f"{title} {description}"
+
+        has_remote = self._contains_any_term(searchable, self.location_remote_terms)
+        has_hybrid = self._contains_any_term(searchable, self.location_hybrid_terms)
+        has_onsite = self._contains_any_term(searchable, self.location_onsite_terms)
+        has_exception = self._contains_any_term(searchable, self.location_exception_terms)
+
+        if has_remote:
+            return {'accepted': True, 'accepted_by_exception': False, 'reason': 'remote'}
+        if (has_hybrid or has_onsite) and has_exception:
+            return {
+                'accepted': True,
+                'accepted_by_exception': True,
+                'reason': 'onsite_or_hybrid_with_visa_or_relocation_exception',
+            }
+        if has_hybrid:
+            return {'accepted': False, 'accepted_by_exception': False, 'reason': 'hybrid_without_exception'}
+        if has_onsite:
+            return {'accepted': False, 'accepted_by_exception': False, 'reason': 'onsite_without_exception'}
+        return {'accepted': False, 'accepted_by_exception': False, 'reason': 'location_unspecified_without_exception'}
+
+    def log_operational_metrics(self):
+        logger.info(
+            "Operational Metrics:\n"
+            f"  google_queries_available={self.metrics['google_queries_available']}\n"
+            f"  google_queries_executed={self.metrics['google_queries_executed']}\n"
+            f"  google_queries_skipped_by_budget={self.metrics['google_queries_skipped_by_budget']}\n"
+            f"  google_rate_limited={self.metrics['google_rate_limited']}\n"
+            f"  google_stopped_early_reason={self.metrics['google_stopped_early_reason'] or 'none'}\n"
+            f"  jobs_rejected_location={self.metrics['jobs_rejected_location']}\n"
+            f"  jobs_accepted_exception={self.metrics['jobs_accepted_exception']}"
+        )
     
     def parse_html(self, html: str) -> BeautifulSoup:
         try:
@@ -541,9 +699,20 @@ class JobSiteScraper:
         sites = google_config.get('sites', [])
         max_results = settings.get('max_results_per_query', 10)
         date_restrict = clamp_google_date_restrict(settings.get('date_restrict', 'd1'))
-        max_queries_per_run = max(1, int(settings.get('max_queries_per_run', 12)))
-        min_seconds_between_queries = max(0.5, float(settings.get('min_seconds_between_queries', 1.2)))
-        max_consecutive_failures = max(1, int(settings.get('max_consecutive_failures', 4)))
+        max_queries_per_run = max(1, int(settings.get('max_queries_per_run', 3)))
+        min_seconds_between_queries = max(0.5, float(settings.get('min_seconds_between_queries', 2.0)))
+        max_consecutive_failures = max(1, int(settings.get('max_consecutive_failures', 1)))
+        google_max_retries_per_query = max(1, int(settings.get('google_max_retries_per_query', 1)))
+        google_stop_on_rate_limit = bool(settings.get('google_stop_on_rate_limit', True))
+        google_query_negative_terms = coerce_string_list(
+            settings.get('google_query_negative_terms'),
+            ['onsite', 'hybrid']
+        )
+        google_schedule_interval_hours = max(1, int(settings.get('google_schedule_interval_hours', 3)))
+        google_query_jitter_max_seconds = max(
+            0.0,
+            min(float(settings.get('google_query_jitter_max_seconds', 0.4)), 2.0)
+        )
         
         if not keywords or not sites:
             logger.warning(f"{site_name}: No keywords or sites configured")
@@ -560,17 +729,42 @@ class JobSiteScraper:
                     all_queries.append((keyword, domain, source_name))
 
             total_available_queries = len(all_queries)
-            selected_queries = all_queries[:max_queries_per_run]
+            selected_queries, rotation_slot, rotation_start = select_rotating_window(
+                all_queries,
+                max_queries_per_run,
+                google_schedule_interval_hours * 3600
+            )
+            selected_count = len(selected_queries)
+            queries_skipped_by_budget = max(0, total_available_queries - selected_count)
+            self.metrics['google_queries_available'] = total_available_queries
+            self.metrics['google_queries_skipped_by_budget'] = queries_skipped_by_budget
+
             if total_available_queries > max_queries_per_run:
                 logger.info(
-                    f"{site_name}: Query budget enabled ({max_queries_per_run}/{total_available_queries} queries this run)"
+                    f"{site_name}: Query budget enabled ({selected_count}/{total_available_queries} queries this run)"
                 )
+            logger.info(
+                f"{site_name}: Query rotation slot={rotation_slot}, start_index={rotation_start}, "
+                f"interval_hours={google_schedule_interval_hours}"
+            )
 
             total_queries = 0
             consecutive_failures = 0
 
+            def next_query_delay() -> float:
+                return min_seconds_between_queries + random.uniform(0.0, google_query_jitter_max_seconds)
+
             for keyword, domain, source_name in selected_queries:
-                query = f'{keyword} site:{domain} remote'
+                negative_clause = " ".join(
+                    f"-{term.lstrip('-').strip()}"
+                    for term in google_query_negative_terms
+                    if term and term.lstrip('-').strip()
+                )
+                query_parts = [keyword, f"site:{domain}", "remote"]
+                if negative_clause:
+                    query_parts.append(negative_clause)
+                query = " ".join(query_parts)
+                error_state: dict[str, Any] = {}
                 data = await http_client.fetch(
                     "https://www.googleapis.com/customsearch/v1",
                     return_json=True,
@@ -580,29 +774,49 @@ class JobSiteScraper:
                         'q': query,
                         'num': max_results,
                         'dateRestrict': date_restrict,
-                    }
+                    },
+                    max_retries_override=google_max_retries_per_query,
+                    fail_fast_on_rate_limit=google_stop_on_rate_limit,
+                    error_state=error_state,
                 )
                 total_queries += 1
+                self.metrics['google_queries_executed'] = total_queries
+
+                if error_state.get('rate_limited'):
+                    self.metrics['google_rate_limited'] += 1
+                    if google_stop_on_rate_limit:
+                        self.metrics['google_stopped_early_reason'] = 'rate_limited'
+                        logger.warning(f"{site_name}: Stopping early due to Google rate-limit response")
+                        break
 
                 if not data:
                     consecutive_failures += 1
                     if consecutive_failures >= max_consecutive_failures:
+                        if not self.metrics['google_stopped_early_reason']:
+                            self.metrics['google_stopped_early_reason'] = 'consecutive_failures'
                         logger.warning(
                             f"{site_name}: Stopping early after {consecutive_failures} consecutive failed queries "
                             f"(likely quota/rate-limit pressure)"
                         )
                         break
-                    await asyncio.sleep(min_seconds_between_queries)
+                    await asyncio.sleep(next_query_delay())
+                    continue
+
+                if 'error' in data:
+                    error_payload = data.get('error', {})
+                    error_msg = error_payload.get('message', 'Unknown error')
+                    logger.warning(f"{site_name}: API error - {error_msg}")
+                    if google_error_is_quota_or_rate_limited(error_payload):
+                        self.metrics['google_rate_limited'] += 1
+                        if google_stop_on_rate_limit:
+                            self.metrics['google_stopped_early_reason'] = 'quota_or_rate_limit_response'
+                            logger.warning(f"{site_name}: Stopping early due to Google quota/rate-limit API error")
+                            break
+                    consecutive_failures += 1
+                    await asyncio.sleep(next_query_delay())
                     continue
 
                 consecutive_failures = 0
-
-                if 'error' in data:
-                    error_msg = data['error'].get('message', 'Unknown error')
-                    logger.warning(f"{site_name}: API error - {error_msg}")
-                    await asyncio.sleep(min_seconds_between_queries)
-                    continue
-
                 items = data.get('items', [])
 
                 for item in items:
@@ -633,11 +847,22 @@ class JobSiteScraper:
                     job_id = self.generate_job_id(title, company, job_url)
 
                     if self.is_new_job(job_id) and self.matches_keywords(job):
+                        location_result = self.classify_location(job)
+                        if not location_result['accepted']:
+                            self.metrics['jobs_rejected_location'] += 1
+                            logger.info(
+                                f"{site_name}: Rejected by location filter "
+                                f"({location_result['reason']}): {title[:120]}"
+                            )
+                            continue
+                        if location_result['accepted_by_exception']:
+                            self.metrics['jobs_accepted_exception'] += 1
                         job['id'] = job_id
+                        job['location_reason'] = location_result['reason']
                         jobs.append(job)
                         self.queue_job_id(job_id)
 
-                await asyncio.sleep(min_seconds_between_queries)
+                await asyncio.sleep(next_query_delay())
             
             health_tracker.record_success(site_name, len(jobs))
             logger.info(f"{site_name}: Found {len(jobs)} new jobs from {total_queries} queries")
@@ -751,7 +976,18 @@ class JobSiteScraper:
                 job_id = self.generate_job_id(title, company, job_url)
                 
                 if self.is_new_job(job_id) and self.matches_keywords(job):
+                    location_result = self.classify_location(job)
+                    if not location_result['accepted']:
+                        self.metrics['jobs_rejected_location'] += 1
+                        logger.info(
+                            f"{site_name}: Rejected by location filter "
+                            f"({location_result['reason']}): {title[:120]}"
+                        )
+                        continue
+                    if location_result['accepted_by_exception']:
+                        self.metrics['jobs_accepted_exception'] += 1
                     job['id'] = job_id
+                    job['location_reason'] = location_result['reason']
                     jobs.append(job)
                     self.queue_job_id(job_id)
             
@@ -1014,6 +1250,7 @@ async def main(dry_run: bool = False, google_only: bool = False):
         elapsed = (datetime.now() - start_time).total_seconds()
         
         logger.info(f"Scraping completed in {elapsed:.2f} seconds")
+        scraper.log_operational_metrics()
         
         if dry_run:
             print_dry_run_report(new_jobs)

@@ -161,6 +161,33 @@ sites:
       company: "[class*='companyName']"
       link: "a[href*='/jobs/']"
 
+# Location filtering for final alert eligibility.
+location_filter:
+  location_filter_mode: "strict_remote_with_exception"
+  location_remote_terms:
+    - "remote"
+    - "work from home"
+    - "wfh"
+    - "distributed"
+    - "anywhere"
+  location_hybrid_terms:
+    - "hybrid"
+    - "2 days onsite"
+    - "3 days onsite"
+    - "partially remote"
+  location_onsite_terms:
+    - "onsite"
+    - "on-site"
+    - "in office"
+    - "office based"
+    - "on site"
+  location_exception_terms:
+    - "visa sponsorship"
+    - "sponsorship available"
+    - "relocation support"
+    - "willing to relocate"
+    - "relocation assistance"
+
 # Global runtime tuning for HTTP behavior, caching, and seen-jobs retention.
 request:
   timeout: 15
