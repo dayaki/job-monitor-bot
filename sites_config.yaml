@@ -112,23 +112,6 @@ sites:
       link: "a[href*='/gig']"
 
   # ========== GENERAL REMOTE SITES ==========
-  dailyremote:
-    name: "DailyRemote"
-    url: "https://dailyremote.com/"
-    type: "html"
-    enabled: true
-    max_jobs: 20
-    selectors:
-      job_container: "div[class*='job'], article[class*='job']"
-      title: "h2, h3, a"
-      company: "[class*='company']"
-      link: "a"
-    fallback_selectors:
-      job_container: ".job-listing"
-      title: ".job-title"
-      company: ".company-name"
-      link: "a[href*='/job/']"
-
   justremote:
     name: "JustRemote"
     url: "https://justremote.co/remote-jobs"
@@ -161,23 +144,6 @@ sites:
       title: ".title"
       link: "a[href*='/job']"
 
-  remoteco:
-    name: "Remote.co"
-    url: "https://remote.co/remote-jobs/"
-    type: "html"
-    enabled: true
-    max_jobs: 20
-    selectors:
-      job_container: "div[class*='job'], article[class*='job']"
-      title: "h2, h3, a"
-      company: "[class*='company']"
-      link: "a"
-    fallback_selectors:
-      job_container: ".job_listing"
-      title: ".position"
-      company: ".company"
-      link: "a[href*='/job/']"
-
   wellfound:
     name: "Wellfound"
     url: "https://wellfound.com/jobs"
@@ -195,20 +161,32 @@ sites:
       company: "[class*='companyName']"
       link: "a[href*='/jobs/']"
 
-  workinstartups:
-    name: "WorkInStartups"
-    url: "https://workinstartups.com/job-board/"
-    type: "html"
-    enabled: true
-    max_jobs: 20
-    selectors:
-      job_container: "div[class*='job']"
-      title: "h3, h2, a"
-      link: "a"
-    fallback_selectors:
-      job_container: ".job-listing"
-      title: ".job-title"
-      link: "a[href*='/job/']"
+# Location filtering for final alert eligibility.
+location_filter:
+  location_filter_mode: "strict_remote_with_exception"
+  location_remote_terms:
+    - "remote"
+    - "work from home"
+    - "wfh"
+    - "distributed"
+    - "anywhere"
+  location_hybrid_terms:
+    - "hybrid"
+    - "2 days onsite"
+    - "3 days onsite"
+    - "partially remote"
+  location_onsite_terms:
+    - "onsite"
+    - "on-site"
+    - "in office"
+    - "office based"
+    - "on site"
+  location_exception_terms:
+    - "visa sponsorship"
+    - "sponsorship available"
+    - "relocation support"
+    - "willing to relocate"
+    - "relocation assistance"
 
 # Global runtime tuning for HTTP behavior, caching, and seen-jobs retention.
 request:

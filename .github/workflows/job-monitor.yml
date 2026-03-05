@@ -5,8 +5,8 @@ name: Job Monitor Bot
 
 on:
   schedule:
-    # Run every hour at minute 0 (00:00, 01:00, 02:00, etc.)
-    - cron: "0 * * * *"
+    # Run every 3 hours at minute 0 (00:00, 03:00, 06:00, etc.)
+    - cron: "0 */3 * * *"
 
   workflow_dispatch: # Allows manual trigger from GitHub Actions tab
 

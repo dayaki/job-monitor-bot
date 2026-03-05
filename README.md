@@ -94,6 +94,12 @@ settings:
   enabled: true
   max_results_per_query: 10
   date_restrict: "d1" # Last 24 hours (code enforces max d2)
+  max_queries_per_run: 3
+  min_seconds_between_queries: 2.0
+  google_max_retries_per_query: 1
+  google_stop_on_rate_limit: true
+  google_schedule_interval_hours: 3
+  google_query_negative_terms: ["onsite", "hybrid"]
 
 keywords:
   - '"React Native"'
@@ -117,7 +123,7 @@ sites:
 
 1. **Load seen jobs** from `seen_jobs.json`
 2. **Scrape all sources** concurrently (APIs + HTML sites)
-3. **Filter jobs** by keywords (searches title only)
+3. **Filter jobs** by title keywords and location policy (remote-first, with visa/relocation exception)
 4. **Deduplicate** using job IDs (skips already-seen jobs and in-run duplicates)
 5. **Send Telegram notification** with retries
 6. **Persist seen jobs only after successful notification**
