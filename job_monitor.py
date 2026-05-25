@@ -476,9 +476,18 @@ class AsyncHTTPClient:
                             continue
                         else:
                             last_error = f"http_{response.status}"
+                            body_snippet = ''
+                            try:
+                                body_text = await response.text()
+                                body_snippet = ' '.join((body_text or '').split())[:300]
+                            except Exception:
+                                pass
                             if error_state is not None:
-                                error_state.update({'last_error': last_error})
-                            logger.warning(f"HTTP {response.status} for {safe_request_url}")
+                                error_state.update({'last_error': last_error, 'body': body_snippet})
+                            logger.warning(
+                                f"HTTP {response.status} for {safe_request_url}"
+                                + (f": {body_snippet}" if body_snippet else "")
+                            )
                             return None
                 except asyncio.TimeoutError:
                     last_error = "timeout"
@@ -571,6 +580,7 @@ class JobSiteScraper:
             'google_queries_skipped_by_budget': 0,
             'google_rate_limited': 0,
             'google_stopped_early_reason': '',
+            'google_last_error': '',
             'jobs_rejected_location': 0,
             'jobs_accepted_exception': 0,
         }
@@ -680,6 +690,7 @@ class JobSiteScraper:
             f"  google_queries_skipped_by_budget={self.metrics['google_queries_skipped_by_budget']}\n"
             f"  google_rate_limited={self.metrics['google_rate_limited']}\n"
             f"  google_stopped_early_reason={self.metrics['google_stopped_early_reason'] or 'none'}\n"
+            f"  google_last_error={self.metrics['google_last_error'] or 'none'}\n"
             f"  jobs_rejected_location={self.metrics['jobs_rejected_location']}\n"
             f"  jobs_accepted_exception={self.metrics['jobs_accepted_exception']}"
         )
@@ -802,6 +813,9 @@ class JobSiteScraper:
                         break
 
                 if not data:
+                    status = error_state.get('status')
+                    detail = error_state.get('body') or error_state.get('last_error') or 'no response'
+                    self.metrics['google_last_error'] = f"HTTP {status}: {detail}"
                     consecutive_failures += 1
                     if consecutive_failures >= max_consecutive_failures:
                         if not self.metrics['google_stopped_early_reason']:
@@ -817,6 +831,7 @@ class JobSiteScraper:
                 if 'error' in data:
                     error_payload = data.get('error', {})
                     error_msg = error_payload.get('message', 'Unknown error')
+                    self.metrics['google_last_error'] = f"API error: {error_msg}"
                     logger.warning(f"{site_name}: API error - {error_msg}")
                     if google_error_is_quota_or_rate_limited(error_payload):
                         self.metrics['google_rate_limited'] += 1
@@ -1205,7 +1220,10 @@ def detect_run_issues(metrics: dict) -> list[str]:
         issues.append("Google ran 0 queries (check API key / quota)")
     reason = metrics.get('google_stopped_early_reason')
     if reason:
-        issues.append(f"Google stopped early: {reason}")
+        detail = metrics.get('google_last_error', '')
+        issues.append(f"Google stopped early: {reason}" + (f" — {detail}" if detail else ""))
+    elif metrics.get('google_last_error'):
+        issues.append(f"Google error: {metrics['google_last_error']}")
     return issues
 
 
