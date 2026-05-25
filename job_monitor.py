@@ -16,7 +16,7 @@ import random
 import re
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
@@ -71,6 +71,7 @@ def load_google_search_config() -> dict:
 CONFIG = load_config()
 REQUEST_CONFIG = CONFIG.get('request', {})
 LOCATION_FILTER_CONFIG = CONFIG.get('location_filter', {})
+NOTIFICATIONS_CONFIG = CONFIG.get('notifications', {})
 TIMEOUT = REQUEST_CONFIG.get('timeout', 15)
 MAX_RETRIES = REQUEST_CONFIG.get('max_retries', 3)
 RETRY_BASE_DELAY = REQUEST_CONFIG.get('retry_base_delay', 1.0)
@@ -193,6 +194,12 @@ class KeywordMatcher:
         if not self.patterns or not title:
             return False
         return any(pattern.search(title) for pattern in self.patterns)
+
+    def matches_text(self, text: str) -> bool:
+        """Word-boundary keyword match against arbitrary text (e.g. a search snippet)."""
+        if not self.patterns or not text:
+            return False
+        return any(pattern.search(text) for pattern in self.patterns)
 
     def possibly_present_in_text(self, text: str) -> bool:
         """Fast pre-check before parsing HTML."""
@@ -555,6 +562,9 @@ class JobSiteScraper:
                 'relocation assistance',
             ]
         )
+        self.accept_unspecified_location = bool(
+            LOCATION_FILTER_CONFIG.get('accept_unspecified_location', False)
+        )
         self.metrics = {
             'google_queries_available': 0,
             'google_queries_executed': 0,
@@ -658,6 +668,8 @@ class JobSiteScraper:
             return {'accepted': False, 'accepted_by_exception': False, 'reason': 'hybrid_without_exception'}
         if has_onsite:
             return {'accepted': False, 'accepted_by_exception': False, 'reason': 'onsite_without_exception'}
+        if self.accept_unspecified_location:
+            return {'accepted': True, 'accepted_by_exception': False, 'reason': 'location_unspecified_accepted'}
         return {'accepted': False, 'accepted_by_exception': False, 'reason': 'location_unspecified_without_exception'}
 
     def log_operational_metrics(self):
@@ -846,7 +858,11 @@ class JobSiteScraper:
                     }
                     job_id = self.generate_job_id(title, company, job_url)
 
-                    if self.is_new_job(job_id) and self.matches_keywords(job):
+                    # The site: query already matched the keyword on the page, and title
+                    # splitting can strip it, so accept a snippet match too (not title-only).
+                    if self.is_new_job(job_id) and (
+                        self.matches_keywords(job) or keyword_matcher.matches_text(snippet)
+                    ):
                         location_result = self.classify_location(job)
                         if not location_result['accepted']:
                             self.metrics['jobs_rejected_location'] += 1
@@ -1043,6 +1059,49 @@ class JobSiteScraper:
         return all_jobs
 
 # ============= TELEGRAM NOTIFICATION =============
+async def _deliver_telegram_message(session, url: str, payload: dict) -> bool:
+    """Send a single Telegram message with retry/backoff. Returns True on success."""
+    for attempt in range(TELEGRAM_MAX_RETRIES):
+        try:
+            async with session.post(url, json=payload) as response:
+                if response.status == 200:
+                    return True
+
+                error_text = await response.text()
+                retriable = response.status in (429, 500, 502, 503, 504)
+                if not retriable:
+                    logger.error(f"Telegram API error (status {response.status}): {error_text}")
+                    return False
+
+                delay = min(TELEGRAM_RETRY_BASE_DELAY * (2 ** attempt), TELEGRAM_RETRY_MAX_DELAY)
+                if response.status == 429:
+                    try:
+                        error_payload = json.loads(error_text)
+                        retry_after = float(error_payload.get('parameters', {}).get('retry_after', 0))
+                        delay = max(delay, retry_after)
+                    except Exception:
+                        pass
+                logger.warning(
+                    f"Telegram API temporary error (status {response.status}), "
+                    f"retrying in {delay}s (attempt {attempt + 1}/{TELEGRAM_MAX_RETRIES})"
+                )
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            delay = min(TELEGRAM_RETRY_BASE_DELAY * (2 ** attempt), TELEGRAM_RETRY_MAX_DELAY)
+            logger.warning(
+                f"Telegram delivery failed ({e}), retrying in {delay}s "
+                f"(attempt {attempt + 1}/{TELEGRAM_MAX_RETRIES})"
+            )
+        except Exception as e:
+            logger.error(f"Unexpected Telegram error: {e}")
+            return False
+
+        if attempt < TELEGRAM_MAX_RETRIES - 1:
+            await asyncio.sleep(delay)
+
+    logger.error("Telegram delivery failed after retries")
+    return False
+
+
 async def send_telegram_notification(jobs: list[dict]) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logger.warning("Telegram credentials not configured")
@@ -1103,55 +1162,7 @@ async def send_telegram_notification(jobs: list[dict]) -> bool:
                 'disable_web_page_preview': True
             }
 
-            delivered = False
-            for attempt in range(TELEGRAM_MAX_RETRIES):
-                try:
-                    async with session.post(url, json=payload) as response:
-                        if response.status == 200:
-                            delivered = True
-                            break
-
-                        error_text = await response.text()
-                        retriable = response.status in (429, 500, 502, 503, 504)
-                        if not retriable:
-                            logger.error(f"Telegram API error (status {response.status}): {error_text}")
-                            return False
-
-                        delay = min(
-                            TELEGRAM_RETRY_BASE_DELAY * (2 ** attempt),
-                            TELEGRAM_RETRY_MAX_DELAY
-                        )
-                        if response.status == 429:
-                            try:
-                                error_payload = json.loads(error_text)
-                                retry_after = float(
-                                    error_payload.get('parameters', {}).get('retry_after', 0)
-                                )
-                                delay = max(delay, retry_after)
-                            except Exception:
-                                pass
-                        logger.warning(
-                            f"Telegram API temporary error (status {response.status}), "
-                            f"retrying in {delay}s (attempt {attempt + 1}/{TELEGRAM_MAX_RETRIES})"
-                        )
-                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                    delay = min(
-                        TELEGRAM_RETRY_BASE_DELAY * (2 ** attempt),
-                        TELEGRAM_RETRY_MAX_DELAY
-                    )
-                    logger.warning(
-                        f"Telegram delivery failed ({e}), retrying in {delay}s "
-                        f"(attempt {attempt + 1}/{TELEGRAM_MAX_RETRIES})"
-                    )
-                except Exception as e:
-                    logger.error(f"Unexpected Telegram error: {e}")
-                    return False
-
-                if attempt < TELEGRAM_MAX_RETRIES - 1:
-                    await asyncio.sleep(delay)
-
-            if not delivered:
-                logger.error("Telegram delivery failed after retries")
+            if not await _deliver_telegram_message(session, url, payload):
                 return False
 
             await asyncio.sleep(0.5)
@@ -1161,6 +1172,67 @@ async def send_telegram_notification(jobs: list[dict]) -> bool:
     except Exception as e:
         logger.error(f"Error sending Telegram notification: {e}")
         return False
+
+
+async def send_telegram_status(text: str) -> bool:
+    """Send a standalone status/heartbeat/alert message (not a job listing)."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.warning("Telegram credentials not configured; skipping status message")
+        return False
+    try:
+        session = await http_client.get_session()
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            'chat_id': TELEGRAM_CHAT_ID,
+            'text': text,
+            'parse_mode': 'HTML',
+            'disable_web_page_preview': True,
+        }
+        return await _deliver_telegram_message(session, url, payload)
+    except Exception as e:
+        logger.error(f"Error sending Telegram status: {e}")
+        return False
+
+
+def detect_run_issues(metrics: dict) -> list[str]:
+    """Return human-readable problems for this run (empty list = healthy)."""
+    issues: list[str] = []
+    for failed in health_tracker.get_failed_sites():
+        issues.append(f"{failed['site']} failing: {failed['error']}")
+    if metrics.get('google_rate_limited', 0) > 0:
+        issues.append(f"Google rate-limited ×{metrics['google_rate_limited']}")
+    if metrics.get('google_queries_available', 0) > 0 and metrics.get('google_queries_executed', 0) == 0:
+        issues.append("Google ran 0 queries (check API key / quota)")
+    reason = metrics.get('google_stopped_early_reason')
+    if reason:
+        issues.append(f"Google stopped early: {reason}")
+    return issues
+
+
+def build_status_message(metrics: dict, new_job_count: int, issues: list[str]) -> str:
+    """Compose a heartbeat (healthy) or alert (issues present) status message."""
+    now = datetime.now().strftime('%Y-%m-%d %H:%M')
+    if issues:
+        lines = ["⚠️ <b>Job Monitor — Issues Detected</b>", f"📅 {now}", ""]
+        for issue in issues:
+            lines.append(f"• {html.escape(issue, quote=False)}")
+    else:
+        lines = ["✅ <b>Job Monitor — Heartbeat</b>", f"📅 {now}"]
+
+    lines.append("")
+    lines.append(f"🆕 New jobs this run: {new_job_count}")
+    lines.append(
+        f"🔎 Google queries: {metrics.get('google_queries_executed', 0)}"
+        f"/{metrics.get('google_queries_available', 0)}"
+    )
+    rejected = metrics.get('jobs_rejected_location', 0)
+    if rejected:
+        lines.append(f"📍 Rejected by location filter: {rejected}")
+    working = health_tracker.get_working_sites()
+    if working:
+        summary = ", ".join(f"{w['site']}({w['jobs_found']})" for w in working)
+        lines.append(f"🌐 Sources: {html.escape(summary, quote=False)}")
+    return "\n".join(lines)
 
 # ============= CLI ARGUMENT PARSING =============
 def parse_args():
@@ -1263,7 +1335,27 @@ async def main(dry_run: bool = False, google_only: bool = False):
                 scraper.mark_jobs_as_seen([job.get('id', '') for job in new_jobs if job.get('id')])
             else:
                 logger.info("No new matching jobs found")
-            
+
+            # Heartbeat / failure alert: separate from job notifications so silence
+            # means "no new jobs", not "the bot broke". Failures never block the run.
+            issues = detect_run_issues(scraper.metrics)
+            if google_only and not (GOOGLE_API_KEY and GOOGLE_CSE_ID):
+                issues.append("Google credentials missing (GOOGLE_API_KEY/GOOGLE_CSE_ID) — no jobs can be found")
+            alert_on_failures = bool(NOTIFICATIONS_CONFIG.get('alert_on_failures', True))
+            heartbeat_enabled = bool(NOTIFICATIONS_CONFIG.get('heartbeat_enabled', True))
+            heartbeat_hour = int(NOTIFICATIONS_CONFIG.get('heartbeat_hour_utc', 9))
+            should_alert = bool(issues) and alert_on_failures
+            should_heartbeat = (
+                heartbeat_enabled
+                and not should_alert
+                and not new_jobs
+                and datetime.now(timezone.utc).hour == heartbeat_hour
+            )
+            if should_alert or should_heartbeat:
+                status_text = build_status_message(scraper.metrics, len(new_jobs), issues)
+                if not await send_telegram_status(status_text):
+                    logger.warning("Failed to send status/heartbeat message")
+
             scraper.save_seen_jobs()
         
     except Exception as e:

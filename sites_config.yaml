@@ -164,6 +164,10 @@ sites:
 # Location filtering for final alert eligibility.
 location_filter:
   location_filter_mode: "strict_remote_with_exception"
+  # Accept results whose title/snippet never mentions location. The Google query already
+  # enforces "remote -onsite -hybrid", so an unspecified snippet is almost always remote.
+  # Set false to revert to rejecting anything not explicitly stated remote.
+  accept_unspecified_location: true
   location_remote_terms:
     - "remote"
     - "work from home"
@@ -187,6 +191,17 @@ location_filter:
     - "relocation support"
     - "willing to relocate"
     - "relocation assistance"
+
+# Heartbeat / failure alerts so silence means "no new jobs", not "the bot broke".
+notifications:
+  # Send a Telegram alert when the run has problems (source failures, Google
+  # rate-limit/quota, zero queries executed, or missing credentials).
+  alert_on_failures: true
+  # Send a daily "still alive" status summary even when there are 0 new jobs.
+  heartbeat_enabled: true
+  # Which run hour (UTC) sends the daily heartbeat. The workflow runs every 3h
+  # (00,03,06,09,...), so this must be a multiple of 3 to fire on schedule.
+  heartbeat_hour_utc: 9
 
 # Global runtime tuning for HTTP behavior, caching, and seen-jobs retention.
 request:

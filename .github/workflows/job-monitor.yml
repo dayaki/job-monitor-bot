@@ -63,7 +63,7 @@ jobs:
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           GOOGLE_CSE_ID: ${{ secrets.GOOGLE_CSE_ID }}
         run: |
-          python job_monitor.py
+          python job_monitor.py --google-only
 
       - name: Commit and push seen jobs
         run: |

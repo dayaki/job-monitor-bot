@@ -21,15 +21,19 @@
 settings:
   enabled: true
   max_results_per_query: 10
-  # Date restrict: limit results to recent posts
-  # Keep this at d1 (24h) for fastest alerts; d2 is the maximum enforced by code.
-  # Supported input examples: d1, d2 (w/m values are clamped to d2)
-  date_restrict: "d1"
+  # Date restrict: limit results to recent posts (d2 = 48h; d2 is the max enforced by code).
+  # Use d2, not d1: with query rotation only a few combos run per cycle, so a combo may
+  # not be revisited for ~20h. A 24h (d1) window leaves a blind spot where fresh jobs are
+  # never queried in time; 48h covers the full rotation. (w/m values are clamped to d2.)
+  date_restrict: "d2"
   # Query budget controls to avoid Google API 429s / daily quota burn.
   # Total query combinations = len(keywords) * len(sites); only this many run per cycle.
-  max_queries_per_run: 3
+  # At 8 runs/day this is 5*8=40 queries/day, well under the 100/day free-tier quota,
+  # and rotates through ~35 combos within ~21h (inside the d2 freshness window).
+  max_queries_per_run: 5
   min_seconds_between_queries: 2.0
-  max_consecutive_failures: 1
+  # Tolerate a few transient (non-rate-limit) failures before aborting the run.
+  max_consecutive_failures: 3
   # Google-specific retry/stop behavior for free-tier quota safety.
   google_max_retries_per_query: 1
   google_stop_on_rate_limit: true
