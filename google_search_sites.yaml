@@ -8,9 +8,9 @@
 
 settings:
   enabled: true
-  # Results per query. >10 costs 2 Serper credits (flat, up to 100); ≤10 costs 1. At 100 you
-  # get ~every matching role in the time window, so country bias barely matters.
-  max_results_per_query: 100
+  # Results per query. ≤10 costs 1 Serper credit; >10 costs a flat 2 (up to 100). 10 is
+  # plenty here — fresh postings per keyword in the time window are rarely more than 10.
+  max_results_per_query: 10
   min_seconds_between_queries: 2.0
   # Tolerate a few transient (non-rate-limit) failures before aborting the run.
   max_consecutive_failures: 3
@@ -21,12 +21,13 @@ settings:
   # Serper does NOT rotate: every run fires one combined query per keyword across ALL
   # boards, so worst-case alert latency == the workflow cron interval (currently 4h).
   # Credits/run = #keywords × (1 if max_results<=10 else 2) × max(1, #countries).
-  # Here: 3 × 2 (num=100) × 1 = 6/run → ~36/day → ~10 weeks on the free ~2,500 credits.
+  # Here: 3 × 1 (num=10) × 1 = 3/run → ~18/day → ~20 weeks on the free ~2,500 credits.
   serper_time_filter: "qdr:d"        # qdr:h/d/w/m/y = past hour/day/week/month/year ("" = no filter)
   # Country ranking bias (Google "gl"). One request runs PER (keyword, country), so total
-  # searches/run = #keywords × #countries. [] = a single unbiased search (recommended with a
-  # high max_results_per_query, since you then get ~everything regardless of country lens).
-  # To bias/expand by region, list ISO codes, e.g. ["us", "gb", "ca", "de", "nl"].
+  # searches/run = #keywords × #countries. [] = a single unbiased search — a good default,
+  # since at typical low daily volume the top-10 already captures everything. To expand by
+  # region (only useful if a keyword exceeds 10 fresh results), list ISO codes, e.g.
+  # ["us", "gb", "ca", "de", "nl"] — note each country multiplies credits.
   serper_countries: []
   serper_max_retries_per_query: 2
   serper_stop_on_rate_limit: true
