@@ -55,10 +55,8 @@ settings:
 # Use quotes for exact phrases
 keywords:
   - '"React Native"'
-  - '"React Native Developer"'
-  - '"Mobile Developer" React'
-  - '"Frontend Developer" React'
-  - '"Full Stack" React Native'
+  - '("iOS Developer" OR "iOS Engineer" OR Swift)'
+  - '("Mobile Developer" OR "Mobile Engineer")'
 
 # Job board sites to search. Serper folds these into one combined query per keyword:
 #   {keyword} remote (site:greenhouse.io OR site:lever.co OR ...) -onsite -hybrid

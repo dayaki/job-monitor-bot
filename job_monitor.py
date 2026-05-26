@@ -806,9 +806,12 @@ class JobSiteScraper:
         source_label: str,
         site_name: str,
         jobs: list[dict],
+        apply_keyword_filter: bool = True,
     ):
-        """Process one web-search result (Google CSE or Serper) into a job, applying
-        keyword + location filters and dedup. Mutates `jobs` and metrics in place."""
+        """Process one web-search result (Google CSE or Serper) into a job, applying the
+        location filter and dedup. Mutates `jobs` and metrics in place. When
+        apply_keyword_filter is True, also requires the SEARCH_KEYWORDS match (used by the
+        legacy Google CSE path); the Serper path leaves the search query as the source of truth."""
         title = (raw_title or '').strip()
         job_url = normalize_job_url(raw_link or '')
         if not title or not job_url:
@@ -833,11 +836,15 @@ class JobSiteScraper:
         }
         job_id = self.generate_job_id(title, company, job_url)
 
-        # The site: query already matched the keyword on the page, and title splitting
-        # can strip it, so accept a snippet match too (not title-only).
-        if not (self.is_new_job(job_id) and (
+        if not self.is_new_job(job_id):
+            return
+        # The search query already targeted the keyword across the page, so re-checking the
+        # title/snippet here is largely redundant for web search (Google's snippet centers on
+        # the matched term) — and it previously dropped real jobs when SEARCH_KEYWORDS drifted
+        # out of sync with the query. Callers opt in; the Serper path skips it.
+        if apply_keyword_filter and not (
             self.matches_keywords(job) or keyword_matcher.matches_text(snippet or '')
-        )):
+        ):
             return
 
         location_result = self.classify_location(job)
@@ -1141,6 +1148,7 @@ class JobSiteScraper:
                         f"Serper-{board}",
                         site_name,
                         jobs,
+                        apply_keyword_filter=False,
                     )
 
                 await asyncio.sleep(next_query_delay())
