@@ -199,9 +199,9 @@ notifications:
   alert_on_failures: true
   # Send a daily "still alive" status summary even when there are 0 new jobs.
   heartbeat_enabled: true
-  # Which run hour (UTC) sends the daily heartbeat. The workflow runs every 3h
-  # (00,03,06,09,...), so this must be a multiple of 3 to fire on schedule.
-  heartbeat_hour_utc: 9
+  # Which run hour (UTC) sends the daily heartbeat. The workflow runs every 4h
+  # (00,04,08,12,16,20), so this must be one of those hours to fire on schedule.
+  heartbeat_hour_utc: 8
 
 # Global runtime tuning for HTTP behavior, caching, and seen-jobs retention.
 request:

@@ -42,6 +42,9 @@ TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY', '')
 GOOGLE_CSE_ID = os.getenv('GOOGLE_CSE_ID', '')
 
+# Serper.dev — Google search results via a single API key (no Cloud project/CSE).
+SERPER_API_KEY = os.getenv('SERPER_API_KEY', '')
+
 # ============= LOAD YAML CONFIG =============
 CONFIG_PATH = Path(__file__).parent / 'sites_config.yaml'
 GOOGLE_SEARCH_CONFIG_PATH = Path(__file__).parent / 'google_search_sites.yaml'
@@ -521,6 +524,100 @@ class AsyncHTTPClient:
                 error_state.update({'last_error': last_error})
             return None
 
+    async def post_json(
+        self,
+        url: str,
+        payload: dict[str, Any],
+        headers: Optional[dict[str, str]] = None,
+        max_retries_override: Optional[int] = None,
+        fail_fast_on_rate_limit: bool = False,
+        error_state: Optional[dict[str, Any]] = None,
+    ) -> Optional[dict]:
+        """POST a JSON body and return the parsed JSON response (or None on failure)."""
+        attempts = max(1, int(max_retries_override if max_retries_override is not None else MAX_RETRIES))
+        safe_url = redact_url(url)
+        merged_headers = dict(self.headers)
+        if headers:
+            merged_headers.update(headers)
+        if error_state is not None:
+            error_state.clear()
+            error_state.update({'last_error': None, 'status': None, 'rate_limited': False})
+
+        async with self._semaphore:
+            session = await self.get_session()
+            last_error = None
+            domain = urlsplit(url).netloc.lower()
+
+            for attempt in range(attempts):
+                try:
+                    await self._apply_domain_throttle(domain)
+                    async with session.post(url, json=payload, headers=merged_headers) as response:
+                        if error_state is not None:
+                            error_state.update({'status': response.status})
+                        if response.status == 200:
+                            text = await response.text()
+                            if not text or not text.strip():
+                                logger.warning(f"Empty response from {safe_url}")
+                                return None
+                            try:
+                                return json.loads(text)
+                            except json.JSONDecodeError as e:
+                                logger.warning(f"Invalid JSON response from {safe_url}: {e}")
+                                return None
+                        elif response.status == 429:
+                            last_error = "rate_limited"
+                            if error_state is not None:
+                                error_state.update({'last_error': last_error, 'rate_limited': True})
+                            delay = min(RETRY_BASE_DELAY * (2 ** attempt), RETRY_MAX_DELAY)
+                            retry_after = response.headers.get('Retry-After')
+                            if retry_after:
+                                try:
+                                    delay = max(delay, float(retry_after))
+                                except ValueError:
+                                    pass
+                            if fail_fast_on_rate_limit:
+                                logger.warning(f"Rate limited on {safe_url}; fail-fast enabled")
+                                return None
+                            logger.warning(f"Rate limited on {safe_url}, waiting {delay}s")
+                            await asyncio.sleep(delay)
+                            continue
+                        else:
+                            last_error = f"http_{response.status}"
+                            body_snippet = ''
+                            try:
+                                body_text = await response.text()
+                                body_snippet = ' '.join((body_text or '').split())[:300]
+                            except Exception:
+                                pass
+                            if error_state is not None:
+                                error_state.update({'last_error': last_error, 'body': body_snippet})
+                            logger.warning(
+                                f"HTTP {response.status} for {safe_url}"
+                                + (f": {body_snippet}" if body_snippet else "")
+                            )
+                            return None
+                except asyncio.TimeoutError:
+                    last_error = "timeout"
+                    if error_state is not None:
+                        error_state.update({'last_error': last_error})
+                    logger.warning(f"Timeout posting to {safe_url} (attempt {attempt + 1}/{attempts})")
+                except aiohttp.ClientError as e:
+                    last_error = str(e)
+                    if error_state is not None:
+                        error_state.update({'last_error': last_error})
+                    logger.warning(f"Client error posting to {safe_url}: {e} (attempt {attempt + 1}/{attempts})")
+                except Exception as e:
+                    logger.error(f"Unexpected error posting to {safe_url}: {e}")
+                    return None
+
+                if attempt < attempts - 1:
+                    await asyncio.sleep(min(RETRY_BASE_DELAY * (2 ** attempt), RETRY_MAX_DELAY))
+
+            logger.error(f"Failed to POST {safe_url} after {attempts} attempts: {last_error}")
+            if error_state is not None:
+                error_state.update({'last_error': last_error})
+            return None
+
 http_client = AsyncHTTPClient()
 
 # ============= JOB SITE SCRAPER =============
@@ -701,6 +798,63 @@ class JobSiteScraper:
         except Exception:
             return BeautifulSoup(html, 'html.parser')
 
+    def _handle_search_item(
+        self,
+        raw_title: str,
+        raw_link: str,
+        snippet: str,
+        source_label: str,
+        site_name: str,
+        jobs: list[dict],
+    ):
+        """Process one web-search result (Google CSE or Serper) into a job, applying
+        keyword + location filters and dedup. Mutates `jobs` and metrics in place."""
+        title = (raw_title or '').strip()
+        job_url = normalize_job_url(raw_link or '')
+        if not title or not job_url:
+            return
+
+        company = ''
+        if ' - ' in title:
+            parts = title.rsplit(' - ', 1)
+            if len(parts) == 2:
+                title, company = parts[0].strip(), parts[1].strip()
+        elif ' | ' in title:
+            parts = title.rsplit(' | ', 1)
+            if len(parts) == 2:
+                title, company = parts[0].strip(), parts[1].strip()
+
+        job = {
+            'title': title,
+            'company': company,
+            'url': job_url,
+            'source': source_label,
+            'description': snippet or '',
+        }
+        job_id = self.generate_job_id(title, company, job_url)
+
+        # The site: query already matched the keyword on the page, and title splitting
+        # can strip it, so accept a snippet match too (not title-only).
+        if not (self.is_new_job(job_id) and (
+            self.matches_keywords(job) or keyword_matcher.matches_text(snippet or '')
+        )):
+            return
+
+        location_result = self.classify_location(job)
+        if not location_result['accepted']:
+            self.metrics['jobs_rejected_location'] += 1
+            logger.info(
+                f"{site_name}: Rejected by location filter "
+                f"({location_result['reason']}): {title[:120]}"
+            )
+            return
+        if location_result['accepted_by_exception']:
+            self.metrics['jobs_accepted_exception'] += 1
+        job['id'] = job_id
+        job['location_reason'] = location_result['reason']
+        jobs.append(job)
+        self.queue_job_id(job_id)
+
     # ============= GOOGLE CUSTOM SEARCH API =============
     async def scrape_google_search(self) -> list[dict]:
         """Search for jobs using Google Custom Search API."""
@@ -844,54 +998,15 @@ class JobSiteScraper:
                     continue
 
                 consecutive_failures = 0
-                items = data.get('items', [])
-
-                for item in items:
-                    title = item.get('title', '')
-                    job_url = normalize_job_url(item.get('link', ''))
-                    snippet = item.get('snippet', '')
-
-                    if not title or not job_url:
-                        continue
-
-                    company = ''
-                    if ' - ' in title:
-                        parts = title.rsplit(' - ', 1)
-                        if len(parts) == 2:
-                            title, company = parts[0].strip(), parts[1].strip()
-                    elif ' | ' in title:
-                        parts = title.rsplit(' | ', 1)
-                        if len(parts) == 2:
-                            title, company = parts[0].strip(), parts[1].strip()
-
-                    job = {
-                        'title': title,
-                        'company': company,
-                        'url': job_url,
-                        'source': f"Google-{source_name}",
-                        'description': snippet
-                    }
-                    job_id = self.generate_job_id(title, company, job_url)
-
-                    # The site: query already matched the keyword on the page, and title
-                    # splitting can strip it, so accept a snippet match too (not title-only).
-                    if self.is_new_job(job_id) and (
-                        self.matches_keywords(job) or keyword_matcher.matches_text(snippet)
-                    ):
-                        location_result = self.classify_location(job)
-                        if not location_result['accepted']:
-                            self.metrics['jobs_rejected_location'] += 1
-                            logger.info(
-                                f"{site_name}: Rejected by location filter "
-                                f"({location_result['reason']}): {title[:120]}"
-                            )
-                            continue
-                        if location_result['accepted_by_exception']:
-                            self.metrics['jobs_accepted_exception'] += 1
-                        job['id'] = job_id
-                        job['location_reason'] = location_result['reason']
-                        jobs.append(job)
-                        self.queue_job_id(job_id)
+                for item in data.get('items', []) or []:
+                    self._handle_search_item(
+                        item.get('title', ''),
+                        item.get('link', ''),
+                        item.get('snippet', ''),
+                        f"Google-{source_name}",
+                        site_name,
+                        jobs,
+                    )
 
                 await asyncio.sleep(next_query_delay())
             
@@ -900,7 +1015,142 @@ class JobSiteScraper:
         except Exception as e:
             health_tracker.record_failure(site_name, str(e))
             logger.error(f"{site_name} error: {e}")
-        
+
+        return jobs
+
+    # ============= SERPER.DEV (GOOGLE RESULTS VIA SINGLE API KEY) =============
+    async def scrape_serper_search(self) -> list[dict]:
+        """Search for jobs via Serper.dev (real Google results, one API key, no CSE).
+
+        Reuses the same keyword/site queries, rotation budget, and filtering as the
+        Google CSE path; only the transport (POST + X-API-KEY) and freshness param differ.
+        """
+        jobs = []
+        site_name = "SerperSearch"
+
+        if not SERPER_API_KEY:
+            logger.debug(f"{site_name}: Skipped (no SERPER_API_KEY)")
+            return jobs
+
+        search_config = load_google_search_config()
+        settings = search_config.get('settings', {})
+
+        if not settings.get('enabled', False):
+            logger.debug(f"{site_name}: Disabled in config")
+            return jobs
+
+        keywords = search_config.get('keywords', [])
+        sites = search_config.get('sites', [])
+        max_results = settings.get('max_results_per_query', 10)
+        min_seconds_between_queries = max(0.0, float(settings.get('min_seconds_between_queries', 1.0)))
+        max_consecutive_failures = max(1, int(settings.get('max_consecutive_failures', 3)))
+        serper_max_retries_per_query = max(1, int(settings.get('serper_max_retries_per_query', 2)))
+        serper_stop_on_rate_limit = bool(settings.get('serper_stop_on_rate_limit', True))
+        # Serper time filter: qdr:h/d/w/m/y (hour/day/week/month/year). Empty = no filter.
+        serper_time_filter = str(settings.get('serper_time_filter', 'qdr:d')).strip()
+        serper_gl = str(settings.get('serper_country', 'us')).strip()
+        negative_terms = coerce_string_list(
+            settings.get('google_query_negative_terms'),
+            ['onsite', 'hybrid']
+        )
+        jitter_max_seconds = max(0.0, min(float(settings.get('google_query_jitter_max_seconds', 0.4)), 2.0))
+
+        if not keywords or not sites:
+            logger.warning(f"{site_name}: No keywords or sites configured")
+            return jobs
+
+        # Map result domains back to friendly board names for the alert "source" label.
+        domain_to_name = {
+            s['domain']: s.get('name', s['domain'])
+            for s in sites if s.get('domain')
+        }
+        domains = list(domain_to_name.keys())
+
+        try:
+            # One combined query per keyword across ALL boards via (site:a OR site:b ...),
+            # so every run covers every board+keyword — no rotation, latency = cron interval.
+            site_clause = "(" + " OR ".join(f"site:{d}" for d in domains) + ")"
+            negative_clause = " ".join(
+                f"-{term.lstrip('-').strip()}"
+                for term in negative_terms
+                if term and term.lstrip('-').strip()
+            )
+            self.metrics['google_queries_available'] = len(keywords)
+
+            total_queries = 0
+            consecutive_failures = 0
+
+            def next_query_delay() -> float:
+                return min_seconds_between_queries + random.uniform(0.0, jitter_max_seconds)
+
+            for keyword in keywords:
+                query_parts = [keyword, "remote", site_clause]
+                if negative_clause:
+                    query_parts.append(negative_clause)
+                query = " ".join(query_parts)
+
+                payload: dict[str, Any] = {'q': query, 'num': max_results}
+                if serper_time_filter:
+                    payload['tbs'] = serper_time_filter
+                if serper_gl:
+                    payload['gl'] = serper_gl
+
+                error_state: dict[str, Any] = {}
+                data = await http_client.post_json(
+                    "https://google.serper.dev/search",
+                    payload=payload,
+                    headers={'X-API-KEY': SERPER_API_KEY},
+                    max_retries_override=serper_max_retries_per_query,
+                    fail_fast_on_rate_limit=serper_stop_on_rate_limit,
+                    error_state=error_state,
+                )
+                total_queries += 1
+                self.metrics['google_queries_executed'] = total_queries
+
+                if error_state.get('rate_limited'):
+                    self.metrics['google_rate_limited'] += 1
+                    if serper_stop_on_rate_limit:
+                        self.metrics['google_stopped_early_reason'] = 'rate_limited'
+                        logger.warning(f"{site_name}: Stopping early due to Serper rate-limit response")
+                        break
+
+                if not data:
+                    status = error_state.get('status')
+                    detail = error_state.get('body') or error_state.get('last_error') or 'no response'
+                    self.metrics['google_last_error'] = f"HTTP {status}: {detail}"
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_consecutive_failures:
+                        if not self.metrics['google_stopped_early_reason']:
+                            self.metrics['google_stopped_early_reason'] = 'consecutive_failures'
+                        logger.warning(
+                            f"{site_name}: Stopping early after {consecutive_failures} consecutive failed queries"
+                        )
+                        break
+                    await asyncio.sleep(next_query_delay())
+                    continue
+
+                consecutive_failures = 0
+                for item in data.get('organic', []) or []:
+                    link = item.get('link', '')
+                    netloc = urlsplit(link).netloc.lower()
+                    board = next((name for dom, name in domain_to_name.items() if dom in netloc), 'Search')
+                    self._handle_search_item(
+                        item.get('title', ''),
+                        link,
+                        item.get('snippet', ''),
+                        f"Serper-{board}",
+                        site_name,
+                        jobs,
+                    )
+
+                await asyncio.sleep(next_query_delay())
+
+            health_tracker.record_success(site_name, len(jobs))
+            logger.info(f"{site_name}: Found {len(jobs)} new jobs from {total_queries} queries")
+        except Exception as e:
+            health_tracker.record_failure(site_name, str(e))
+            logger.error(f"{site_name} error: {e}")
+
         return jobs
 
     # ============= GENERIC HTML SCRAPER (Config-driven) =============
@@ -1048,10 +1298,11 @@ class JobSiteScraper:
     async def scrape_all_sites(self) -> list[dict]:
         logger.info(f"Starting concurrent scrape with keywords: {SEARCH_KEYWORDS}")
         
+        # Prefer Serper (one key, no CSE) when configured; otherwise Google CSE.
         api_tasks = [
-            self.scrape_google_search(),
+            self.scrape_serper_search() if SERPER_API_KEY else self.scrape_google_search(),
         ]
-        
+
         html_task = self.scrape_all_html_sites()
         
         all_results = await asyncio.gather(*api_tasks, html_task, return_exceptions=True)
@@ -1215,15 +1466,15 @@ def detect_run_issues(metrics: dict) -> list[str]:
     for failed in health_tracker.get_failed_sites():
         issues.append(f"{failed['site']} failing: {failed['error']}")
     if metrics.get('google_rate_limited', 0) > 0:
-        issues.append(f"Google rate-limited ×{metrics['google_rate_limited']}")
+        issues.append(f"Search rate-limited ×{metrics['google_rate_limited']}")
     if metrics.get('google_queries_available', 0) > 0 and metrics.get('google_queries_executed', 0) == 0:
-        issues.append("Google ran 0 queries (check API key / quota)")
+        issues.append("Search ran 0 queries (check API key / quota)")
     reason = metrics.get('google_stopped_early_reason')
     if reason:
         detail = metrics.get('google_last_error', '')
-        issues.append(f"Google stopped early: {reason}" + (f" — {detail}" if detail else ""))
+        issues.append(f"Search stopped early: {reason}" + (f" — {detail}" if detail else ""))
     elif metrics.get('google_last_error'):
-        issues.append(f"Google error: {metrics['google_last_error']}")
+        issues.append(f"Search error: {metrics['google_last_error']}")
     return issues
 
 
@@ -1240,7 +1491,7 @@ def build_status_message(metrics: dict, new_job_count: int, issues: list[str]) -
     lines.append("")
     lines.append(f"🆕 New jobs this run: {new_job_count}")
     lines.append(
-        f"🔎 Google queries: {metrics.get('google_queries_executed', 0)}"
+        f"🔎 Search queries: {metrics.get('google_queries_executed', 0)}"
         f"/{metrics.get('google_queries_available', 0)}"
     )
     rejected = metrics.get('jobs_rejected_location', 0)
@@ -1266,6 +1517,11 @@ def parse_args():
         '--google-only',
         action='store_true',
         help='Only run Google Custom Search scraper (useful for testing Google API setup)'
+    )
+    parser.add_argument(
+        '--serper-only',
+        action='store_true',
+        help='Only run the Serper.dev search scraper (Google results via a single API key)'
     )
     return parser.parse_args()
 
@@ -1318,22 +1574,26 @@ def print_dry_run_report(jobs: list[dict]):
     print("=" * 60 + "\n")
 
 # ============= MAIN =============
-async def main(dry_run: bool = False, google_only: bool = False):
+async def main(dry_run: bool = False, google_only: bool = False, serper_only: bool = False):
     logger.info("=" * 50)
     logger.info("Job Monitor Bot Starting")
     if dry_run:
         logger.info("🧪 DRY RUN MODE - No notifications, no seen_jobs.json updates")
+    if serper_only:
+        logger.info("🔍 SERPER ONLY MODE - Only running Serper.dev search")
     if google_only:
         logger.info("🔍 GOOGLE ONLY MODE - Only running Google Custom Search")
     logger.info(f"Search keywords: {SEARCH_KEYWORDS}")
     logger.info(f"Concurrent limit: {CONCURRENT_LIMIT}")
     logger.info("=" * 50)
-    
+
     scraper = JobSiteScraper()
-    
+
     try:
         start_time = datetime.now()
-        if google_only:
+        if serper_only:
+            new_jobs = await scraper.scrape_serper_search()
+        elif google_only:
             new_jobs = await scraper.scrape_google_search()
         else:
             new_jobs = await scraper.scrape_all_sites()
@@ -1357,7 +1617,9 @@ async def main(dry_run: bool = False, google_only: bool = False):
             # Heartbeat / failure alert: separate from job notifications so silence
             # means "no new jobs", not "the bot broke". Failures never block the run.
             issues = detect_run_issues(scraper.metrics)
-            if google_only and not (GOOGLE_API_KEY and GOOGLE_CSE_ID):
+            if serper_only and not SERPER_API_KEY:
+                issues.append("SERPER_API_KEY missing — no jobs can be found")
+            elif google_only and not (GOOGLE_API_KEY and GOOGLE_CSE_ID):
                 issues.append("Google credentials missing (GOOGLE_API_KEY/GOOGLE_CSE_ID) — no jobs can be found")
             alert_on_failures = bool(NOTIFICATIONS_CONFIG.get('alert_on_failures', True))
             heartbeat_enabled = bool(NOTIFICATIONS_CONFIG.get('heartbeat_enabled', True))
@@ -1386,4 +1648,8 @@ async def main(dry_run: bool = False, google_only: bool = False):
 
 if __name__ == "__main__":
     args = parse_args()
-    asyncio.run(main(dry_run=args.dry_run, google_only=args.google_only))
+    asyncio.run(main(
+        dry_run=args.dry_run,
+        google_only=args.google_only,
+        serper_only=args.serper_only,
+    ))

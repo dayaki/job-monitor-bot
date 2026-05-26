@@ -5,8 +5,9 @@ name: Job Monitor Bot
 
 on:
   schedule:
-    # Run every 3 hours at minute 0 (00:00, 03:00, 06:00, etc.)
-    - cron: "0 */3 * * *"
+    # Run every 4 hours at minute 0 (00:00, 04:00, 08:00, etc.)
+    # With combined-site Serper queries, this is also the worst-case alert latency.
+    - cron: "0 */4 * * *"
 
   workflow_dispatch: # Allows manual trigger from GitHub Actions tab
 
@@ -60,10 +61,9 @@ jobs:
           SEARCH_KEYWORDS: ${{ secrets.SEARCH_KEYWORDS }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-          GOOGLE_CSE_ID: ${{ secrets.GOOGLE_CSE_ID }}
+          SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
         run: |
-          python job_monitor.py --google-only
+          python job_monitor.py --serper-only
 
       - name: Commit and push seen jobs
         run: |

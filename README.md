@@ -4,8 +4,8 @@ Automated job search bot that scrapes 20+ job sites and sends Telegram notificat
 
 ## Features
 
-- **Multi-source scraping** — Searches Google Custom Search and 15+ HTML job boards
-- **Title-only keyword filtering** — Matches keywords against job titles only
+- **Google search via Serper.dev** — Real Google results across job-board domains using a single API key (no Google Cloud project or Custom Search Engine to set up)
+- **Title + snippet keyword filtering** — Matches keywords against the result title or snippet
 - **Duplicate detection** — Tracks seen jobs to avoid repeat notifications
 - **Telegram notifications** — Get instant alerts on your phone
 - **GitHub Actions** — Runs automatically on a schedule (hourly, daily, etc.)
@@ -24,8 +24,9 @@ Go to **Settings → Secrets and variables → Actions** and add:
 | `TELEGRAM_BOT_TOKEN` | ✅       | Your Telegram bot token from [@BotFather](https://t.me/BotFather)           |
 | `TELEGRAM_CHAT_ID`   | ✅       | Your Telegram chat ID (use [@userinfobot](https://t.me/userinfobot))        |
 | `SEARCH_KEYWORDS`    | ✅       | Comma-separated keywords, e.g., `react,react native,mobile`                 |
-| `GOOGLE_API_KEY`     | Optional | Google Custom Search API key                                                |
-| `GOOGLE_CSE_ID`      | Optional | Google Custom Search Engine ID                                              |
+| `SERPER_API_KEY`     | ✅       | API key from [serper.dev](https://serper.dev) (Google results, free tier)   |
+| `GOOGLE_API_KEY`     | Legacy   | Google Custom Search API key (only used if `SERPER_API_KEY` is unset)       |
+| `GOOGLE_CSE_ID`      | Legacy   | Google Custom Search Engine ID (only used if `SERPER_API_KEY` is unset)     |
 
 ### 3. Enable GitHub Actions
 
@@ -117,7 +118,8 @@ sites:
 | Flag            | Description                                                             |
 | --------------- | ----------------------------------------------------------------------- |
 | `--dry-run`     | Test mode: scrape but don't send notifications or update seen_jobs.json |
-| `--google-only` | Only run Google Custom Search scraper                                   |
+| `--serper-only` | Only run the Serper.dev search scraper (the default in CI)              |
+| `--google-only` | Only run the legacy Google Custom Search scraper                        |
 
 ## How It Works
 
