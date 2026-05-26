@@ -1,65 +1,42 @@
-# Google Custom Search Sites Configuration
-# Add sites and keywords to search for jobs using Google Custom Search API
+# Serper.dev search configuration — what the bot searches Google for.
 #
-# Format:
-#   - Each entry under 'sites' defines a job board domain to search
-#   - 'keywords' are combined with each site to form search queries
-#   - Example query: "React Native" site:greenhouse.io remote
-#
-# Requirements:
-#   - GOOGLE_API_KEY: Your Google Cloud API key
-#   - GOOGLE_CSE_ID: Your Custom Search Engine ID
-#
-# Setup:
-#   1. Create a Google Cloud project: https://console.cloud.google.com/
-#   2. Enable "Custom Search API"
-#   3. Create API credentials (API Key)
-#   4. Create a Programmable Search Engine: https://programmablesearchengine.google.com/
-#   5. Set it to "Search the entire web"
-#   6. Copy the Search Engine ID
+# How it works:
+#   - Each entry under 'keywords' becomes ONE combined query across all 'sites' via
+#     (site:a OR site:b ...), e.g.:
+#       "React Native" remote (site:greenhouse.io OR site:lever.co OR ...) -onsite -hybrid
+#   - Requires the SERPER_API_KEY secret (get a free key at https://serper.dev).
 
 settings:
   enabled: true
   max_results_per_query: 10
-  # Date restrict: limit results to recent posts (d2 = 48h; d2 is the max enforced by code).
-  # Use d2, not d1: with query rotation only a few combos run per cycle, so a combo may
-  # not be revisited for ~20h. A 24h (d1) window leaves a blind spot where fresh jobs are
-  # never queried in time; 48h covers the full rotation. (w/m values are clamped to d2.)
-  date_restrict: "d2"
   min_seconds_between_queries: 2.0
   # Tolerate a few transient (non-rate-limit) failures before aborting the run.
   max_consecutive_failures: 3
-  google_query_negative_terms:
+  # Excluded from every query so onsite/hybrid roles don't surface.
+  query_negative_terms:
     - "onsite"
     - "hybrid"
 
-  # ---- Legacy Google Custom Search only (ignored by Serper) ----
-  # These drive the dormant --google-only path; Serper does not rotate or use a query budget.
-  max_queries_per_run: 5
-  google_max_retries_per_query: 1
-  google_stop_on_rate_limit: true
-  google_schedule_interval_hours: 3
-
-  # ---- Serper.dev (active search provider: real Google results, one API key, no CSE) ----
-  # Active when SERPER_API_KEY is set. Serper does NOT rotate: every run fires one combined
-  # query per keyword across ALL boards via (site:a OR site:b ...), so worst-case alert
-  # latency == the workflow cron interval (currently 4h). Searches/day = #keywords * runs/day
-  # (5 keywords * 6 runs = ~30/day). Serper's one-time free allotment (~2,500 credits) lasts
-  # ~12 weeks at that rate; trim keywords below or slow the cron to stretch it further.
+  # Serper does NOT rotate: every run fires one combined query per keyword across ALL
+  # boards, so worst-case alert latency == the workflow cron interval (currently 4h).
+  # Searches/day = #keywords * runs/day (3 keywords * 6 runs = ~18/day). Serper's one-time
+  # free allotment (~2,500 credits) lasts ~20 weeks at that rate; trim keywords or slow
+  # the cron to stretch it further.
   serper_time_filter: "qdr:d"        # qdr:h/d/w/m/y = past hour/day/week/month/year ("" = no filter)
   serper_country: "us"               # Google "gl" geo bias
   serper_max_retries_per_query: 2
   serper_stop_on_rate_limit: true
 
-# Keywords to search for (combined with each site)
-# Use quotes for exact phrases
+# Keywords to search for. Each becomes one combined-site query. Use quotes for exact
+# phrases; ("A" OR "B") groups variants into a single query (one credit).
 keywords:
   - '"React Native"'
   - '("iOS Developer" OR "iOS Engineer" OR Swift)'
   - '("Mobile Developer" OR "Mobile Engineer")'
 
-# Job board sites to search. Serper folds these into one combined query per keyword:
+# Job board sites. Serper folds these into one combined query per keyword:
 #   {keyword} remote (site:greenhouse.io OR site:lever.co OR ...) -onsite -hybrid
+# Keep this list and your search engine in sync if you add domains.
 sites:
   # ===== ATS Platforms =====
   - domain: "greenhouse.io"

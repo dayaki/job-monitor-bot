@@ -58,12 +58,11 @@ jobs:
 
       - name: Run job search
         env:
-          SEARCH_KEYWORDS: ${{ secrets.SEARCH_KEYWORDS }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
         run: |
-          python job_monitor.py --serper-only
+          python job_monitor.py
 
       - name: Commit and push seen jobs
         run: |

@@ -1,110 +1,72 @@
 # Job Monitor Bot
 
-Automated job search bot that scrapes 20+ job sites and sends Telegram notifications for new postings matching your keywords. Runs on GitHub Actions with zero infrastructure costs.
+Automated job-search bot that searches Google (via [Serper.dev](https://serper.dev)) across job-board domains and sends Telegram notifications for new remote postings matching your keywords. Runs on GitHub Actions with zero infrastructure costs.
 
 ## Features
 
 - **Google search via Serper.dev** — Real Google results across job-board domains using a single API key (no Google Cloud project or Custom Search Engine to set up)
-- **Title + snippet keyword filtering** — Matches keywords against the result title or snippet
+- **Combined-site queries** — One query per keyword spans all boards via `(site:a OR site:b …)`, so every run covers everything
+- **Location filtering** — Remote-first, with a visa/relocation exception for onsite/hybrid roles
 - **Duplicate detection** — Tracks seen jobs to avoid repeat notifications
-- **Telegram notifications** — Get instant alerts on your phone
-- **GitHub Actions** — Runs automatically on a schedule (hourly, daily, etc.)
-- **Async & fast** — Concurrent scraping with retry logic and rate limiting
+- **Telegram notifications** — Get instant alerts on your phone, plus a daily heartbeat and failure alerts
+- **GitHub Actions** — Runs automatically on a schedule (every 4 hours by default)
 
 ## Quick Start
 
 ### 1. Fork this repository
 
-### 2. Set up GitHub Secrets
+### 2. Get a Serper API key
+
+Sign up at [serper.dev](https://serper.dev) (free tier, ~2,500 one-time credits) and copy your API key. No Google Cloud project or Programmable Search Engine is needed — Serper queries Google directly.
+
+### 3. Set up GitHub Secrets
 
 Go to **Settings → Secrets and variables → Actions** and add:
 
-| Secret               | Required | Description                                                                 |
-| -------------------- | -------- | --------------------------------------------------------------------------- |
-| `TELEGRAM_BOT_TOKEN` | ✅       | Your Telegram bot token from [@BotFather](https://t.me/BotFather)           |
-| `TELEGRAM_CHAT_ID`   | ✅       | Your Telegram chat ID (use [@userinfobot](https://t.me/userinfobot))        |
-| `SEARCH_KEYWORDS`    | ✅       | Comma-separated keywords, e.g., `react,react native,mobile`                 |
-| `SERPER_API_KEY`     | ✅       | API key from [serper.dev](https://serper.dev) (Google results, free tier)   |
-| `GOOGLE_API_KEY`     | Legacy   | Google Custom Search API key (only used if `SERPER_API_KEY` is unset)       |
-| `GOOGLE_CSE_ID`      | Legacy   | Google Custom Search Engine ID (only used if `SERPER_API_KEY` is unset)     |
+| Secret               | Required | Description                                                          |
+| -------------------- | -------- | -------------------------------------------------------------------- |
+| `TELEGRAM_BOT_TOKEN` | ✅       | Your Telegram bot token from [@BotFather](https://t.me/BotFather)    |
+| `TELEGRAM_CHAT_ID`   | ✅       | Your Telegram chat ID (use [@userinfobot](https://t.me/userinfobot)) |
+| `SERPER_API_KEY`     | ✅       | API key from [serper.dev](https://serper.dev)                        |
 
-### 3. Enable GitHub Actions
+Keywords and target job boards are configured in `google_search_sites.yaml` (not a secret).
 
-The workflow runs automatically every hour. You can also trigger it manually from the **Actions** tab.
+### 4. Enable GitHub Actions
+
+The workflow runs automatically every 4 hours. You can also trigger it manually from the **Actions** tab.
 
 ## Local Development
 
 ```bash
-# Create virtual environment
 python3 -m venv venv
 source venv/bin/activate
-
-# Install dependencies
 pip install -r requirements.txt
 
-# Set environment variables
 export TELEGRAM_BOT_TOKEN="your_token"
 export TELEGRAM_CHAT_ID="your_chat_id"
-export SEARCH_KEYWORDS="react,react native,mobile"
+export SERPER_API_KEY="your_serper_key"
 
-# Run with dry-run (no notifications, no seen_jobs updates)
+# Dry run: search but don't send notifications or update seen_jobs.json
 python job_monitor.py --dry-run
-
-# Test specific scrapers
-python job_monitor.py --google-only --dry-run
 ```
 
 ## Configuration
 
-### `sites_config.yaml`
-
-Configure HTML job sites and runtime request tuning:
-
-```yaml
-sites:
-  weworkremotely:
-    name: "WeWorkRemotely"
-    url: "https://weworkremotely.com/remote-jobs/search?term=developer"
-    type: "html"
-    enabled: true
-    max_jobs: 20
-    selectors:
-      job_container: ".jobs article"
-      title: ".title"
-      company: ".company"
-      link: "a"
-
-request:
-  timeout: 15
-  max_retries: 3
-  retry_base_delay: 1.0
-  retry_max_delay: 10.0
-  concurrent_limit: 10
-  per_domain_min_interval: 0.2
-  cache_ttl_seconds: 900
-  seen_jobs_ttl_days: 90
-  telegram_max_retries: 3
-```
-
-### `google_search_sites.yaml`
-
-Configure Google Custom Search queries:
+### `google_search_sites.yaml` — what to search for
 
 ```yaml
 settings:
   enabled: true
   max_results_per_query: 10
-  date_restrict: "d1" # Last 24 hours (code enforces max d2)
-  max_queries_per_run: 3
-  min_seconds_between_queries: 2.0
-  google_max_retries_per_query: 1
-  google_stop_on_rate_limit: true
-  google_schedule_interval_hours: 3
-  google_query_negative_terms: ["onsite", "hybrid"]
+  serper_time_filter: "qdr:d" # past day; qdr:h/d/w/m/y or "" for none
+  serper_country: "us"
+  query_negative_terms: ["onsite", "hybrid"]
 
+# Each keyword becomes ONE combined query across all sites below.
 keywords:
   - '"React Native"'
-  - '"Mobile Developer"'
+  - '("iOS Developer" OR "iOS Engineer" OR Swift)'
+  - '("Mobile Developer" OR "Mobile Engineer")'
 
 sites:
   - domain: "greenhouse.io"
@@ -113,46 +75,30 @@ sites:
     name: "Lever"
 ```
 
+Searches/day = `#keywords × runs/day`. At 3 keywords and 6 runs/day that's ~18 — comfortably within Serper's free tier (~2,500 credits ≈ 20 weeks).
+
+### `sites_config.yaml` — filtering, alerts, runtime tuning
+
+Holds the `location_filter` (remote policy), `notifications` (heartbeat + failure alerts), and `request` (HTTP timeouts/retries, seen-jobs retention) sections.
+
 ## CLI Options
 
-| Flag            | Description                                                             |
-| --------------- | ----------------------------------------------------------------------- |
-| `--dry-run`     | Test mode: scrape but don't send notifications or update seen_jobs.json |
-| `--serper-only` | Only run the Serper.dev search scraper (the default in CI)              |
-| `--google-only` | Only run the legacy Google Custom Search scraper                        |
+| Flag        | Description                                                          |
+| ----------- | -------------------------------------------------------------------- |
+| `--dry-run` | Search but don't send notifications or update `seen_jobs.json`       |
 
 ## How It Works
 
 1. **Load seen jobs** from `seen_jobs.json`
-2. **Scrape all sources** concurrently (APIs + HTML sites)
-3. **Filter jobs** by title keywords and location policy (remote-first, with visa/relocation exception)
-4. **Deduplicate** using job IDs (skips already-seen jobs and in-run duplicates)
+2. **Search** — one combined `(site:… OR …)` Google query per keyword via Serper
+3. **Filter** by location policy (remote-first, with a visa/relocation exception)
+4. **Deduplicate** using job IDs (skips already-seen and in-run duplicates)
 5. **Send Telegram notification** with retries
-6. **Persist seen jobs only after successful notification**
+6. **Persist seen jobs** only after a successful notification, committed back to the repo
 
-## Adding New Job Sites
+## Adding Job Boards
 
-### HTML Sites
-
-Add an entry to `sites_config.yaml`:
-
-```yaml
-sites:
-  my_new_site:
-    name: "My New Site"
-    url: "https://example.com/jobs"
-    type: "html"
-    enabled: true
-    selectors:
-      job_container: ".job-card"
-      title: "h2"
-      company: ".company-name"
-      link: "a"
-```
-
-### Google Search Sites
-
-Add to `google_search_sites.yaml`:
+Add a domain to the `sites:` list in `google_search_sites.yaml`:
 
 ```yaml
 sites:
@@ -160,23 +106,33 @@ sites:
     name: "New Site"
 ```
 
+It's automatically folded into each keyword's combined query — no other setup needed.
+
+## Cadence & Latency
+
+Because every run covers all keywords and boards, your worst-case alert latency equals the schedule interval. Change the `cron` in `.github/workflows/job-monitor.yml`:
+
+```yaml
+- cron: "0 */4 * * *" # every 4 hours (default)
+```
+
+More frequent = fresher alerts but more Serper credits; less frequent stretches the free tier.
+
 ## Troubleshooting
 
 ### Jobs not showing up?
 
-- Check `--dry-run` output for failed sites
-- Verify CSS selectors match the site's HTML structure
-- Ensure API credentials are correct
+- Run `python job_monitor.py --dry-run` locally with `SERPER_API_KEY` set.
+- Check the GitHub Actions logs — the `google_last_error` line in **Operational Metrics** reports the exact Serper error, and failures are also pushed to Telegram.
+- Broaden or adjust the `keywords` in `google_search_sites.yaml`.
+
+### Out of Serper credits?
+
+You'll get a Telegram failure alert (rate-limit/quota). Lower the cron frequency, trim keywords, or upgrade your Serper plan.
 
 ### Duplicate notifications?
 
-- Make sure `seen_jobs.json` is being committed back to the repo
-- Check GitHub Actions logs for save errors
-
-### Rate limited?
-
-- Reduce `concurrent_limit` in `sites_config.yaml`
-- Increase `retry_base_delay` for slower retries
+- Make sure `seen_jobs.json` is being committed back to the repo (check Actions logs for push errors).
 
 ## License
 
