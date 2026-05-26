@@ -570,7 +570,7 @@ class JobSiteScraper:
         serper_gl = str(settings.get('serper_country', 'us')).strip()
         negative_terms = coerce_string_list(
             settings.get('query_negative_terms'),
-            ['onsite', 'hybrid']
+            []
         )
         jitter_max_seconds = max(0.0, min(float(settings.get('query_jitter_max_seconds', 0.4)), 2.0))
 
@@ -603,7 +603,9 @@ class JobSiteScraper:
                 return min_seconds_between_queries + random.uniform(0.0, jitter_max_seconds)
 
             for keyword in keywords:
-                query_parts = [keyword, "remote", site_clause]
+                # No location terms baked in — every matching role is returned regardless
+                # of remote/onsite/hybrid. Set query_negative_terms in config to re-exclude.
+                query_parts = [keyword, site_clause]
                 if negative_clause:
                     query_parts.append(negative_clause)
                 query = " ".join(query_parts)

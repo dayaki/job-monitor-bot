@@ -12,10 +12,9 @@ settings:
   min_seconds_between_queries: 2.0
   # Tolerate a few transient (non-rate-limit) failures before aborting the run.
   max_consecutive_failures: 3
-  # Excluded from every query so onsite/hybrid roles don't surface.
-  query_negative_terms:
-    - "onsite"
-    - "hybrid"
+  # Terms excluded from every query (e.g. ["onsite", "hybrid"]). Empty = no exclusions,
+  # so onsite/hybrid roles are returned too (you filter by opening the link yourself).
+  query_negative_terms: []
 
   # Serper does NOT rotate: every run fires one combined query per keyword across ALL
   # boards, so worst-case alert latency == the workflow cron interval (currently 4h).

@@ -2,11 +2,12 @@
 # (What the bot searches for is configured in google_search_sites.yaml — the Serper search.)
 
 # Location filtering for final alert eligibility.
+# DISABLED — mode "off" sends every matching result to Telegram (no remote/onsite/hybrid
+# filtering); you open the link and decide. To re-enable remote-first filtering (with a
+# visa/relocation exception for onsite/hybrid), set the mode back to
+# "strict_remote_with_exception". The term lists below are only used in that mode.
 location_filter:
-  location_filter_mode: "strict_remote_with_exception"
-  # Accept results whose title/snippet never mentions location. The search query already
-  # enforces "remote -onsite -hybrid", so an unspecified snippet is almost always remote.
-  # Set false to revert to rejecting anything not explicitly stated remote.
+  location_filter_mode: "off"
   accept_unspecified_location: true
   location_remote_terms:
     - "remote"
