@@ -592,7 +592,18 @@ class JobSiteScraper:
         serper_stop_on_rate_limit = bool(settings.get('serper_stop_on_rate_limit', True))
         # Serper time filter: qdr:h/d/w/m/y (hour/day/week/month/year). Empty = no filter.
         serper_time_filter = str(settings.get('serper_time_filter', 'qdr:d')).strip()
-        serper_gl = str(settings.get('serper_country', 'us')).strip()
+        # Country bias(es) for Google ranking (gl). One request is sent per (keyword, country),
+        # so total searches = keywords × countries. Accepts a list or comma-separated string,
+        # and the legacy single 'serper_country'. Empty => one unbiased search.
+        raw_countries = settings.get('serper_countries', settings.get('serper_country', ''))
+        if isinstance(raw_countries, str):
+            countries = [c.strip().lower() for c in raw_countries.split(',') if c.strip()]
+        elif isinstance(raw_countries, list):
+            countries = [str(c).strip().lower() for c in raw_countries if str(c).strip()]
+        else:
+            countries = []
+        if not countries:
+            countries = ['']  # single unbiased query
         negative_terms = coerce_string_list(
             settings.get('query_negative_terms'),
             []
@@ -619,7 +630,18 @@ class JobSiteScraper:
                 for term in negative_terms
                 if term and term.lstrip('-').strip()
             )
-            self.metrics['google_queries_available'] = len(keywords)
+            # One query per keyword (no location terms baked in — every matching role is
+            # returned regardless of remote/onsite/hybrid; set query_negative_terms to
+            # re-exclude). Fan out across countries: one request per (keyword, country).
+            query_specs: list[tuple[str, str]] = []
+            for keyword in keywords:
+                query_parts = [keyword, site_clause]
+                if negative_clause:
+                    query_parts.append(negative_clause)
+                query = " ".join(query_parts)
+                for gl in countries:
+                    query_specs.append((query, gl))
+            self.metrics['google_queries_available'] = len(query_specs)
 
             total_queries = 0
             consecutive_failures = 0
@@ -627,19 +649,12 @@ class JobSiteScraper:
             def next_query_delay() -> float:
                 return min_seconds_between_queries + random.uniform(0.0, jitter_max_seconds)
 
-            for keyword in keywords:
-                # No location terms baked in — every matching role is returned regardless
-                # of remote/onsite/hybrid. Set query_negative_terms in config to re-exclude.
-                query_parts = [keyword, site_clause]
-                if negative_clause:
-                    query_parts.append(negative_clause)
-                query = " ".join(query_parts)
-
+            for query, gl in query_specs:
                 payload: dict[str, Any] = {'q': query, 'num': max_results}
                 if serper_time_filter:
                     payload['tbs'] = serper_time_filter
-                if serper_gl:
-                    payload['gl'] = serper_gl
+                if gl:
+                    payload['gl'] = gl
 
                 error_state: dict[str, Any] = {}
                 data = await http_client.post_json(
