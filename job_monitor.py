@@ -89,18 +89,21 @@ SENSITIVE_QUERY_KEYS = {
 
 
 def normalize_job_url(url: str) -> str:
-    """Normalize URL by stripping fragment and tracking query parameters."""
+    """Canonicalize a URL for dedup: lowercase scheme/host, drop the fragment, the trailing
+    slash, and tracking query params. Two links to the same posting collapse to one string."""
     if not url:
         return ''
     try:
         parts = urlsplit(url.strip())
+        netloc = parts.netloc.lower()
+        path = parts.path.rstrip('/') or '/'
         clean_query = []
         for key, value in parse_qsl(parts.query, keep_blank_values=True):
             lowered = key.lower()
             if lowered.startswith('utm_') or lowered in {'ref', 'source', 'fbclid', 'gclid'}:
                 continue
             clean_query.append((key, value))
-        return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(clean_query), ''))
+        return urlunsplit((parts.scheme.lower(), netloc, path, urlencode(clean_query), ''))
     except Exception:
         return url.strip()
 
@@ -421,9 +424,10 @@ class JobSiteScraper:
             newest_first = sorted(self.seen_jobs.items(), key=lambda item: item[1], reverse=True)
             self.seen_jobs = dict(newest_first[:SEEN_JOBS_MAX])
     
-    def generate_job_id(self, title: str, company: str, url: str) -> str:
-        unique_string = f"{title}|{company}|{normalize_job_url(url)}".lower()
-        return hashlib.md5(unique_string.encode()).hexdigest()
+    def generate_job_id(self, url: str) -> str:
+        # Dedup on the normalized URL alone — it uniquely identifies a posting and is
+        # immune to Google title/snippet drift and trailing-slash/host-case variants.
+        return hashlib.md5(normalize_job_url(url).encode()).hexdigest()
     
     def is_new_job(self, job_id: str) -> bool:
         return job_id not in self.seen_jobs and job_id not in self.pending_job_ids
@@ -469,6 +473,26 @@ class JobSiteScraper:
         if self.accept_unspecified_location:
             return {'accepted': True, 'accepted_by_exception': False, 'reason': 'location_unspecified_accepted'}
         return {'accepted': False, 'accepted_by_exception': False, 'reason': 'location_unspecified_without_exception'}
+
+    def location_hint(self, job: dict) -> str:
+        """Short location label for the Telegram message, independent of the filter mode
+        (which may be off). Best-effort from the title+snippet — open the link to confirm."""
+        searchable = f"{job.get('title', '')} {job.get('description', '')}".lower()
+        has_remote = self._contains_any_term(searchable, self.location_remote_terms)
+        has_hybrid = self._contains_any_term(searchable, self.location_hybrid_terms)
+        has_onsite = self._contains_any_term(searchable, self.location_onsite_terms)
+        has_exception = self._contains_any_term(searchable, self.location_exception_terms)
+        if has_remote:
+            label = "Remote"
+        elif has_hybrid:
+            label = "Hybrid"
+        elif has_onsite:
+            label = "Onsite"
+        else:
+            label = "Location unclear"
+        if has_exception and label != "Remote":
+            label += " · visa/relocation"
+        return label
 
     def log_operational_metrics(self):
         logger.info(
@@ -517,7 +541,7 @@ class JobSiteScraper:
             'source': source_label,
             'description': snippet or '',
         }
-        job_id = self.generate_job_id(title, company, job_url)
+        job_id = self.generate_job_id(job_url)
 
         if not self.is_new_job(job_id):
             return
@@ -534,6 +558,7 @@ class JobSiteScraper:
             self.metrics['jobs_accepted_exception'] += 1
         job['id'] = job_id
         job['location_reason'] = location_result['reason']
+        job['location_hint'] = self.location_hint(job)
         jobs.append(job)
         self.queue_job_id(job_id)
 
@@ -747,11 +772,17 @@ async def send_telegram_notification(jobs: list[dict]) -> bool:
             title = _escape_text(job.get('title', ''), 100)
             company = _escape_text(job.get('company', ''), 50, fallback='')
             source = _escape_text(job.get('source', ''), 60)
+            hint = _escape_text(job.get('location_hint', ''), 60, fallback='')
+            snippet = _escape_text(job.get('description', ''), 200, fallback='')
             url = html.escape(job.get('url', ''), quote=True)
 
             job_text = f"<b>{i}. {title}</b>\n"
             if company:
                 job_text += f"🏢 {company}\n"
+            if hint:
+                job_text += f"📍 {hint}\n"
+            if snippet:
+                job_text += f"📝 {snippet}\n"
             job_text += f"🌐 {source}\n"
             if url:
                 job_text += f"🔗 <a href=\"{url}\">Apply Here</a>\n\n"

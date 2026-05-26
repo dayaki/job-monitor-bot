@@ -94,7 +94,7 @@ Holds the `location_filter` (remote policy), `notifications` (heartbeat + failur
 3. **Filter** by location policy (remote-first, with a visa/relocation exception)
 4. **Deduplicate** using job IDs (skips already-seen and in-run duplicates)
 5. **Send Telegram notification** with retries
-6. **Persist seen jobs** only after a successful notification, committed back to the repo
+6. **Persist seen jobs** only after a successful notification, saved to the GitHub Actions cache (restored on the next run)
 
 ## Adding Job Boards
 
@@ -132,7 +132,7 @@ You'll get a Telegram failure alert (rate-limit/quota). Lower the cron frequency
 
 ### Duplicate notifications?
 
-- Make sure `seen_jobs.json` is being committed back to the repo (check Actions logs for push errors).
+- Dedup state lives in the Actions cache (`seen-jobs-*`). If the cache is evicted (rare — it's accessed every run), you may get a one-time repeat batch. Check the "Restore/Save seen jobs" steps in the Actions logs.
 
 ## License
 

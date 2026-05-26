@@ -18,23 +18,21 @@ concurrency:
 jobs:
   search-jobs:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
-      contents: write # Required to commit and push changes
+      contents: read
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.12"
 
       - name: Cache pip dependencies
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
@@ -46,15 +44,19 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Download previous seen jobs
-        continue-on-error: true
-        run: |
-          if [ -f seen_jobs.json ]; then
-            echo "Found existing seen_jobs.json"
-          else
-            echo "No previous seen_jobs.json found, creating empty one"
-            echo "{}" > seen_jobs.json
-          fi
+      # Dedup state (the "seen" job IDs) lives in the Actions cache, not the repo — so the
+      # bot no longer commits seen_jobs.json on every run. Restore the most recent cache via
+      # the restore-keys prefix; save under a unique per-run key (cache keys are immutable).
+      - name: Restore seen jobs
+        uses: actions/cache/restore@v4
+        with:
+          path: seen_jobs.json
+          key: seen-jobs-${{ github.run_id }}
+          restore-keys: |
+            seen-jobs-
+
+      - name: Ensure seen_jobs.json exists
+        run: '[ -f seen_jobs.json ] || echo "{}" > seen_jobs.json'
 
       - name: Run job search
         env:
@@ -64,48 +66,15 @@ jobs:
         run: |
           python job_monitor.py
 
-      - name: Commit and push seen jobs
-        run: |
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
-          git add seen_jobs.json
-          if ! git diff --quiet --cached; then
-            git commit -m "Update seen jobs [skip ci]"
-            for attempt in 1 2 3; do
-              if git pull --rebase origin "${GITHUB_REF_NAME}"; then
-                if git push; then
-                  echo "✓ Seen jobs updated and pushed"
-                  exit 0
-                fi
-              else
-                git rebase --abort || true
-              fi
-              echo "Retrying push (attempt ${attempt}/3)"
-              sleep $((attempt * 2))
-            done
-            echo "::error::Failed to push seen_jobs.json after 3 attempts"
-            exit 1
-          else
-            echo "ℹ No changes to seen jobs"
-          fi
+      - name: Save seen jobs
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: seen_jobs.json
+          key: seen-jobs-${{ github.run_id }}
 
----
-# Alternative schedule options (choose one and replace the cron line above):
-
-# Every 2 hours:
-# - cron: '0 */2 * * *'
-
-# Every 3 hours:
-# - cron: '0 */3 * * *'
-
-# Every 6 hours:
-# - cron: '0 */6 * * *'
-
-# Every day at 9 AM UTC:
-# - cron: '0 9 * * *'
-
-# Every weekday at 9 AM and 5 PM UTC:
-# - cron: '0 9,17 * * 1-5'
-
-# Every Monday at 9 AM UTC:
-# - cron: '0 9 * * 1'
+# ---------------------------------------------------------------------------
+# Alternative schedules (replace the cron above):
+#   every 2h: '0 */2 * * *'   every 6h: '0 */6 * * *'   daily 9am UTC: '0 9 * * *'
+# If you change the interval, update notifications.heartbeat_hour_utc in
+# sites_config.yaml to an hour the schedule actually runs.
