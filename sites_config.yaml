@@ -2,13 +2,29 @@
 # (What the bot searches for is configured in google_search_sites.yaml — the Serper search.)
 
 # Location filtering for final alert eligibility.
-# DISABLED — mode "off" sends every matching result to Telegram (no remote/onsite/hybrid
-# filtering); you open the link and decide. To re-enable remote-first filtering (with a
-# visa/relocation exception for onsite/hybrid), set the mode back to
-# "strict_remote_with_exception". The term lists below are only used in that mode.
+# remote/onsite/hybrid filtering is DISABLED (mode "off") — every matching result is sent;
+# you open the link and decide. To re-enable remote-first filtering (with a visa/relocation
+# exception), set the mode to "strict_remote_with_exception" (the remote/hybrid/onsite/
+# exception term lists below are only used in that mode).
 location_filter:
   location_filter_mode: "off"
   accept_unspecified_location: true
+  # Always-on regional exclude (works regardless of the mode above): drop any result whose
+  # title or snippet mentions one of these as a WHOLE WORD. Add countries/cities to taste.
+  exclude_location_terms:
+    - "india"
+    - "bengaluru"
+    - "bangalore"
+    - "mumbai"
+    - "delhi"
+    - "hyderabad"
+    - "pune"
+    - "chennai"
+    - "gurgaon"
+    - "gurugram"
+    - "noida"
+    - "kolkata"
+    - "ahmedabad"
   location_remote_terms:
     - "remote"
     - "work from home"

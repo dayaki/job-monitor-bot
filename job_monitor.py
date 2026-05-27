@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import random
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -368,6 +369,16 @@ class JobSiteScraper:
         self.accept_unspecified_location = bool(
             LOCATION_FILTER_CONFIG.get('accept_unspecified_location', False)
         )
+        # Always-on exclude list (independent of location_filter_mode): drop results whose
+        # title/snippet mentions any of these as a WHOLE WORD. Whole-word matching keeps
+        # "india" from nuking "Indiana"/"Indianapolis".
+        self.exclude_location_terms = coerce_string_list(
+            LOCATION_FILTER_CONFIG.get('exclude_location_terms'), []
+        )
+        self._exclude_location_patterns = [
+            re.compile(rf'(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])')
+            for term in self.exclude_location_terms
+        ]
         self.metrics = {
             'google_queries_available': 0,
             'google_queries_executed': 0,
@@ -376,6 +387,7 @@ class JobSiteScraper:
             'google_stopped_early_reason': '',
             'google_last_error': '',
             'jobs_rejected_location': 0,
+            'jobs_excluded_location': 0,
             'jobs_accepted_exception': 0,
         }
     
@@ -474,6 +486,17 @@ class JobSiteScraper:
             return {'accepted': True, 'accepted_by_exception': False, 'reason': 'location_unspecified_accepted'}
         return {'accepted': False, 'accepted_by_exception': False, 'reason': 'location_unspecified_without_exception'}
 
+    def matched_exclude_term(self, job: dict) -> Optional[str]:
+        """Return the first exclude term appearing as a whole word in the title/snippet, else
+        None. Applied to every result regardless of location_filter_mode."""
+        if not self._exclude_location_patterns:
+            return None
+        searchable = f"{job.get('title', '')} {job.get('description', '')}".lower()
+        for term, pattern in zip(self.exclude_location_terms, self._exclude_location_patterns):
+            if pattern.search(searchable):
+                return term
+        return None
+
     def location_hint(self, job: dict) -> str:
         """Short location label for the Telegram message, independent of the filter mode
         (which may be off). Best-effort from the title+snippet — open the link to confirm."""
@@ -504,6 +527,7 @@ class JobSiteScraper:
             f"  google_stopped_early_reason={self.metrics['google_stopped_early_reason'] or 'none'}\n"
             f"  google_last_error={self.metrics['google_last_error'] or 'none'}\n"
             f"  jobs_rejected_location={self.metrics['jobs_rejected_location']}\n"
+            f"  jobs_excluded_location={self.metrics['jobs_excluded_location']}\n"
             f"  jobs_accepted_exception={self.metrics['jobs_accepted_exception']}"
         )
     
@@ -544,6 +568,13 @@ class JobSiteScraper:
         job_id = self.generate_job_id(job_url)
 
         if not self.is_new_job(job_id):
+            return
+
+        excluded_term = self.matched_exclude_term(job)
+        if excluded_term:
+            self.metrics['jobs_excluded_location'] += 1
+            self.queue_job_id(job_id)  # don't re-evaluate/re-count this URL again this run
+            logger.info(f"{site_name}: Excluded (matched '{excluded_term}'): {title[:120]}")
             return
 
         location_result = self.classify_location(job)
@@ -892,6 +923,9 @@ def build_status_message(metrics: dict, new_job_count: int, issues: list[str]) -
     rejected = metrics.get('jobs_rejected_location', 0)
     if rejected:
         lines.append(f"📍 Rejected by location filter: {rejected}")
+    excluded = metrics.get('jobs_excluded_location', 0)
+    if excluded:
+        lines.append(f"🚫 Excluded (location): {excluded}")
     working = health_tracker.get_working_sites()
     if working:
         summary = ", ".join(f"{w['site']}({w['jobs_found']})" for w in working)

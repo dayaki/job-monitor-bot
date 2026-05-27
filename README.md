@@ -79,7 +79,7 @@ Searches/day = `#keywords × runs/day`. At 3 keywords and 6 runs/day that's ~18 
 
 ### `sites_config.yaml` — filtering, alerts, runtime tuning
 
-Holds the `location_filter` (remote policy), `notifications` (heartbeat + failure alerts), and `request` (HTTP timeouts/retries, seen-jobs retention) sections.
+Holds the `location_filter` (remote policy + an always-on `exclude_location_terms` list that drops results whose title/snippet mentions a given country/city as a whole word — e.g. India), `notifications` (heartbeat + failure alerts), and `request` (HTTP timeouts/retries, seen-jobs retention) sections.
 
 ## CLI Options
 
